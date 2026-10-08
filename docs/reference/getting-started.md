@@ -94,6 +94,91 @@ user.
 - **Not tested:** the kernel and operator, herdr, reboot, suspend and resume,
   cross-host operation and long-running work.
 
+### WSL2 networking and `.wslconfig` (Mirrored mode vs NAT)
+
+If your Windows host configures experimental WSL2 features in `%USERPROFILE%\.wslconfig`, specifically `networkingMode=mirrored` and `firewall=true`, starting the daemon may fail with:
+
+```text
+Daemon on port 7433 is unresponsive, and daemon state is missing — recover it before starting a new daemon.
+```
+
+and `rig daemon status` may report:
+
+```text
+Daemon state UNVERIFIED — the probe timed out or was inconclusive (this is NOT evidence the daemon is down).
+```
+
+#### Environment check
+
+Run a quick probe against an unoccupied port on loopback:
+
+```sh
+curl -v --connect-timeout 1 http://127.0.0.1:7433/
+```
+
+- **Clean / unaffected (NAT mode):** The command fails immediately with `Connection refused` (in `< 10ms`). The Linux kernel sends an instant `TCP RST`, allowing OpenRig's pre-flight check to verify that no daemon is running.
+- **Affected (Mirrored mode + Firewall):** The command hangs and times out (`Connection timed out after 1000 milliseconds`).
+
+You can also check whether your Windows configuration uses mirrored networking (from WSL):
+
+```sh
+cat /mnt/c/Users/*/.wslconfig 2>/dev/null
+```
+
+Look for `networkingMode=mirrored` and `firewall=true`.
+
+#### Why this happens
+
+OpenRig follows strict epistemic safety rules (Ruling 1ae863d2): before launching a daemon, it probes `http://127.0.0.1:7433/healthz` with a 250ms deadline. Under standard Linux and vanilla WSL2 NAT mode, a closed port immediately replies with `TCP RST` (`ECONNREFUSED`), proving no daemon is occupying the port.
+
+Under WSL2 `networkingMode=mirrored` with `firewall=true`, WSL routes `127.0.0.1` through virtual interface `loopback0` to the Windows host. Windows Defender Firewall's default **Stealth Mode** silently drops incoming SYN packets on closed ports rather than returning `TCP RST`. OpenRig's pre-flight probe hits the 250ms timeout and assumes an unresponsive, wedged daemon is already occupying the port, blocking startup.
+
+#### Approach 1: Bind OpenRig to `127.0.0.2` (Keep Mirrored Networking)
+
+In WSL2 mirrored mode, only `127.0.0.1` is forwarded over `loopback0` to Windows. The rest of the IPv4 loopback subnet (`127.0.0.2` through `127.255.255.254`) and IPv6 `::1` remain entirely on the Linux kernel's local `lo` interface, generating instant `ECONNREFUSED` responses on closed ports.
+
+Configure `daemon.host` in OpenRig's persistent configuration:
+
+```sh
+rig config set daemon.host 127.0.0.2
+```
+
+Then start the daemon normally:
+
+```sh
+rig daemon start --no-kernel
+```
+
+*(You can also pass `--host 127.0.0.2` or `--host ::1` directly on the command line).*
+
+- **Benefits:** Keeps all mirrored networking advantages (VPN compatibility, shared LAN IP, native IPv6) without changing Windows or WSL settings.
+
+#### Approach 2: Switch WSL2 Networking Configuration (Align with Vanilla WSL2)
+
+If you prefer to keep OpenRig on default `127.0.0.1` without modifying `daemon.host`, update `%USERPROFILE%\.wslconfig` (typically `/mnt/c/Users/<username>/.wslconfig`):
+
+- **Option A (Revert to default NAT mode, matching the verified setup):**
+  ```ini
+  [wsl2]
+  networkingMode=nat
+  ```
+
+- **Option B (Retain mirrored mode, disable firewall packet filtering):**
+  ```ini
+  [experimental]
+  networkingMode=mirrored
+  firewall=false
+  ```
+
+After editing `.wslconfig`, restart WSL from PowerShell:
+
+```powershell
+wsl --shutdown
+```
+
+Once WSL restarts, closed loopback ports will return `ECONNREFUSED` immediately, and `rig daemon start --no-kernel` will succeed on default `127.0.0.1`.
+
+
 ## Install and sign in
 
 **Agents:** if you're setting OpenRig up for someone, load the `rigs` skill and follow it. It carries the install, the
