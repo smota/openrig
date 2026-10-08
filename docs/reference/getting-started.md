@@ -13,6 +13,9 @@ desktop; it does not need to type into your current terminal. See
 `rig tui` is the team dashboard; installation ends when you are talking to the
 operator in the OpenRig view.
 
+> [!TIP]
+> **New to OpenRig?** For a complete, step-by-step introduction designed for new operators—covering core concepts, configuration file locations and intentions, onboarding your first project, and operating your first rig—explore the [OpenRig Onboarding Guide](onboarding/index.md).
+
 ## Before you start
 
 You need Node.js 22 or 24 and tmux, on macOS or Linux. On Linux, the
