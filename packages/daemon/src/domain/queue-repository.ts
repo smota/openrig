@@ -83,6 +83,9 @@ export function hasLiveHumanGate(item: {
 const AUTO_UNPARK_WAKE_TAG = "queue:auto-unpark:blocker";
 const AUTO_UNPARK_BLOCKER_TAG_PREFIX = "queue:auto-unpark:blocker-ref:";
 
+/** The actor on the transition routeToFallback writes; the row's own history is how a later reroute finds the line it wrote. */
+const FALLBACK_ACTOR = "system:queue-fallback";
+
 /** 0.5.1-53 Atom 1a — typed non-qitem gate blocker prefixes. A park may be gated on a fold / auth /
  *  external condition that is NOT a qitem and NOT a human seat; these prefixes make such a gate a
  *  first-class, compact-visible, downstream-classifiable blocker (the ruling detail rides a transition). */
@@ -343,6 +346,9 @@ export interface QueueUpdateInput {
   transitionNote?: string;
   closureReason?: string;
   closureTarget?: string;
+  /** The outcome stored in queue_items.resolution when this update closes a row that is still open;
+   *  appended after anything the row already carries. Ignored on every other update. */
+  resolution?: string;
   /**
    * PL-004 Phase D extension: when set, persists the queue_items.handed_off_to
    * column. Used by workflow-projector for state=handed-off transitions so
@@ -515,6 +521,19 @@ export function deriveCrossHostSuccessorId(
   return `qitem-xh-${digest}`;
 }
 
+/** The retained next owner must describe this closure, not a handoff before a reopen. */
+export function matchesRecordedHandoffTarget(
+  qitemId: string, handedOffTo: string | null, closureTarget: string | null,
+): boolean {
+  if (!handedOffTo || !closureTarget) return false;
+  if (closureTarget === handedOffTo) return true;
+  // Cross-host re-drives preserve the pre-convention member@rig@host target.
+  const legacy = /^(.+)@([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(closureTarget);
+  if (legacy?.[1] === handedOffTo) return true;
+  const foreign = /^(qitem-[^@]+)@([^@]+)$/.exec(closureTarget);
+  return foreign !== null && foreign[1] === deriveCrossHostSuccessorId(qitemId, handedOffTo, foreign[2]!);
+}
+
 /** PL-007 — defensive column probe. Older test fixtures bypass the
  *  canonical migration list, so target_repo may be absent. Mirrors
  *  the `hasNodeColumn` pattern in rig-repository.ts. */
@@ -627,6 +646,10 @@ export function destinationRigTeaching(session: string): Record<string, unknown>
  * gateway resolver (how to register + "not an agent seat"). Loads the registry only for
  * the (rare) @external refusal path. Undefined for non-@external / registered / scheme.
  */
+/** Refusal teachings issued because nobody is registered yet (the load result's `noHumans`), so the refusal's
+ *  wording can say so. Kept off the teaching object itself, whose fields are unchanged. */
+const NOBODY_REGISTERED_TEACHINGS = new WeakSet<object>();
+
 export function externalAdmissionTeaching(
   session: string,
   loadRegistry: () => LoadResult = loadHumanRegistry,
@@ -635,6 +658,19 @@ export function externalAdmissionTeaching(
   if (parsed.kind !== "external") return undefined;
   if (resolveExternal(parsed.local, []).kind === "scheme") return undefined;
   const reg = loadRegistry();
+  if (!reg.ok && reg.noHumans) {
+    // Nobody registered yet: not a broken registry. Same fields as below; the hint names the registration verb.
+    const teaching = {
+      externalDomain: parsed.domain,
+      registryLoadError: true,
+      registryError: reg.error,
+      hint:
+        `human registry admission is unavailable because no human is registered yet: ${reg.error}. ` +
+        "Register the person with rig gateway human add; do not downgrade the destination to an agent seat.",
+    };
+    NOBODY_REGISTERED_TEACHINGS.add(teaching);
+    return teaching;
+  }
   if (!reg.ok) {
     return {
       externalDomain: parsed.domain,
@@ -670,7 +706,9 @@ function destinationValidationError(
   if (teaching?.registryLoadError === true) {
     return new QueueRepositoryError(
       "human_registry_unavailable",
-      `${field} ${session} cannot be admitted because the human registry failed to load: ${String(teaching.registryError)}`,
+      NOBODY_REGISTERED_TEACHINGS.has(teaching)
+        ? `${field} ${session} cannot be admitted because no human is registered yet: ${String(teaching.registryError)}`
+        : `${field} ${session} cannot be admitted because the human registry failed to load: ${String(teaching.registryError)}`,
       teaching,
     );
   }
@@ -2068,6 +2106,8 @@ export class QueueRepository {
     /** `handed-off` for /handoff; `done` for /handoff-and-complete. */
     terminalState: "handed-off" | "done";
     transitionNote?: string;
+    /** The sender's recorded provenance, as the local handoff records it. Null only for an in-process caller. */
+    identityProvenance?: string | null;
   }): { item: QueueItem; absorbed: boolean } {
     const source = this.getById(input.qitemId);
     if (!source) {
@@ -2117,6 +2157,7 @@ export class QueueRepository {
         transitionNote: input.transitionNote ?? `cross-host handoff to ${input.toSession}`,
         closureReason: "handed_off_to",
         closureTarget: input.closureTarget,
+        identityProvenance: input.identityProvenance ?? null,
       });
 
       // OPR.0.5.8.1 S1b — third member of the handoff family, same bypass.
@@ -2141,7 +2182,7 @@ export class QueueRepository {
         qitemId: input.qitemId,
         terminalState: input.terminalState,
         actorSession: input.fromSession,
-        identityProvenance: null,
+        identityProvenance: input.identityProvenance ?? null,
         ts,
       })) {
         events.push(dependentEvent);
@@ -2798,6 +2839,15 @@ export class QueueRepository {
     // NULL. The prior `COALESCE(?, blocked_on)` preserved the blocker on every non-blocked
     // transition, leaving dead blockers that nothing audits (the root-cause strand).
     const nextBlockedOn = input.state === "blocked" ? effectiveBlockedOn : null;
+    // The outcome is used only as non-blank text on the update that closes an open row; on any other
+    // update the field is ignored and the row answers as it would without it. It goes after what the row
+    // already carries (a pod-fallback line, or an earlier close's outcome) on its own line, text as sent.
+    const closingResolution = typeof input.resolution === "string" && input.resolution.trim().length > 0
+      && isBlockerLive(qitem.state) && !isBlockerLive(input.state)
+      ? input.resolution : null;
+    const nextResolution = closingResolution === null
+      ? qitem.resolution
+      : qitem.resolution ? `${qitem.resolution}\n${closingResolution}` : closingResolution;
     const notification = this.classifyOwnerNotification({
       action: "update",
       destinationSession: qitem.destinationSession,
@@ -2816,7 +2866,8 @@ export class QueueRepository {
                closure_reason = COALESCE(?, closure_reason),
                closure_target = COALESCE(?, closure_target),
                handed_off_to = COALESCE(?, handed_off_to),
-               blocked_on = ?
+               blocked_on = ?,
+               resolution = ?
          WHERE qitem_id = ?`
       )
       .run(
@@ -2826,6 +2877,7 @@ export class QueueRepository {
         validation.closureTarget,
         input.handedOffTo ?? null,
         nextBlockedOn,
+        nextResolution,
         input.qitemId
       );
 
@@ -3067,6 +3119,17 @@ export class QueueRepository {
     });
   }
 
+  /** The transition that closed a row: the first of the trailing run in its current closed state.
+   *  Later notes and delivery receipts on a closed row repeat that state, so the latest transition
+   *  is not the close. Null while the row is still active (pending, in-progress, blocked). */
+  closingTransition(qitemId: string, currentState: string): ReturnType<QueueTransitionLog["listForQitem"]>[number] | null {
+    if (isBlockerLive(currentState)) return null;
+    const transitions = this.transitionLog.listForQitem(qitemId);
+    let closing = null;
+    for (let i = transitions.length - 1; i >= 0 && transitions[i]!.state === currentState; i--) closing = transitions[i]!;
+    return closing;
+  }
+
   /** Read-only scope-aware RECENT projection. Normalization and its hard cap
    * live with the append-only transition log; the repository owns the public
    * queue-domain door. */
@@ -3126,11 +3189,21 @@ export class QueueRepository {
       const firedEvents = targets.map(recordFired);
       if (deliveryStatus === "retained") return firedEvents;
       if (usageLimitBlockers.length === 0) {
-        if (parkGeneratedTimer && !backOffQueueWait(this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db), jobId, deliveryStatus)) {
-          (this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db)).markTerminal(
+        const jobsRepo = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+        if (parkGeneratedTimer && !backOffQueueWait(jobsRepo, jobId, deliveryStatus)) {
+          jobsRepo.markTerminal(
             jobId,
             "park_timer_fired_once",
           );
+        } else if (!parkGeneratedTimer) {
+          // A one-shot generated job whose original park has ended and whose last attachment this attempt just
+          // consumed is retired now, not at its next check: while it stayed active, --wake-watchdog could attach
+          // another task to it. Repeating (queue-wait) jobs keep their own lifecycle.
+          const job = jobsRepo.getById(jobId);
+          if (job && !isQueueWait(job.specYaml)) {
+            const reason = this.resolveWatchdogPreDeliveryTerminalReason(jobId);
+            if (reason) jobsRepo.markTerminal(jobId, reason);
+          }
         }
         return firedEvents;
       }
@@ -3276,6 +3349,17 @@ export class QueueRepository {
   private replyToFallbackFor(qitemId: string): string | null {
     const choice = this.replyToChoiceFor(qitemId);
     return choice?.kind === "fallback" ? describeReplyToFallback(choice) : null;
+  }
+
+  /** The parked query's obligation face: open rows to one destination, newest first, without the per-row
+   *  projections list() derives (pickup, waiting view, delivery ledger), which this read never uses. */
+  listOpenObligations(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null }> {
+    const rows = this.db.prepare(
+      `SELECT qitem_id, state${this.hasSummaryColumn ? ", summary" : ""} FROM queue_items
+        WHERE destination_session = ? AND state IN ('pending', 'in-progress', 'blocked')
+        ORDER BY ts_created DESC LIMIT ?`,
+    ).all(destinationSession, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
+    return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
   list(opts: QueueListOptions & { compact: true }): CompactQueueItem[];
@@ -3784,6 +3868,55 @@ export class QueueRepository {
   }
 
   /**
+   * Where, in the row's `resolution`, the fallback line `routeToFallback` last wrote begins; null when it cannot be
+   * told, and the field is then left whole. The row's own transitions say what that reroute printed: a newest-first
+   * seek by row on the live log, then on the archive the retention sweep moves an aged closed row's transitions to,
+   * stopping at the reroute's own transition (the in-process one, with no identity provenance), whose note is `fallback-routed: <from> → <to> (<reason>)`. The line is
+   * `fallback: <reason>`, built from the same printed reason, so it starts at a line start `i` of the field with
+   * `fallback: ` there and the rest of the field, `r`, satisfying note ends with ` (r)`. Neither the destinations nor
+   * the chain are consulted, so how a value was stored cannot matter. At most one `i` can satisfy it when the field
+   * ends with that line: a longer `r` would have to be preceded in the note by ` (`, and a shorter one starts inside the
+   * reason, right after a newline, which is not ` (`.
+   *
+   * A close that came after that reroute from an open state may have appended an outcome behind the line, and an
+   * outcome can read like the line, so then only a field that is nothing but the line (`i` = 0, which an appended
+   * outcome would lengthen) is accepted.
+   */
+  private fallbackLineStart(qitemId: string, resolution: string): number | null {
+    let note: string | null = null;
+    let newerClosed = false;
+    let outcomeMayFollow = false;
+    for (const table of ["queue_transitions", ...(detectTable(this.db, "queue_transitions_archive") ? ["queue_transitions_archive"] : [])]) {
+      // The reroute's transition is written in-process, so it has no identity provenance; the update route records one
+      // on every write and takes the actor and note from the request, so a transition it wrote can carry the same
+      // actor and note without being a reroute (the trust rule replyToChoiceFor uses). A schema without the column
+      // predates the update route's provenance and reads every row as unstamped.
+      const stamped = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === "identity_provenance");
+      const newestFirst = this.db.prepare(
+        `SELECT state, actor_session, transition_note, ${stamped ? "identity_provenance" : "NULL AS identity_provenance"} FROM ${table} WHERE qitem_id = ? ORDER BY transition_id DESC`,
+      );
+      for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null; identity_provenance: string | null }>) {
+        if (newerClosed && isBlockerLive(row.state as QueueState)) outcomeMayFollow = true;
+        if (row.identity_provenance === null && row.actor_session === FALLBACK_ACTOR && row.transition_note?.startsWith("fallback-routed: ")) {
+          note = row.transition_note;
+          break;
+        }
+        newerClosed = !isBlockerLive(row.state as QueueState);
+      }
+      if (note !== null) break;
+    }
+    if (note === null) return null;
+    const printed = note;
+    const startsHere = (i: number) =>
+      resolution.startsWith("fallback: ", i) && (i === 0 || resolution[i - 1] === "\n") && printed.endsWith(` (${resolution.slice(i + "fallback: ".length)})`);
+    if (outcomeMayFollow) return startsHere(0) ? 0 : null;
+    for (let i = 0; i < resolution.length; i = resolution.indexOf("\n", i) + 1 || resolution.length) {
+      if (startsHere(i)) return i;
+    }
+    return null;
+  }
+
+  /**
    * Pod-fallback: redirect qitem to a fallback destination (e.g., when a seat
    * is unreachable). Emits qitem.fallback_routed; preserves chain_of_record.
    */
@@ -3796,6 +3929,17 @@ export class QueueRepository {
     const originalDestination = qitem.destinationSession;
     const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
 
+    // The field held only a fallback line before a close could store an outcome. The line this method last
+    // wrote is replaced, as it always was; anything else in the field is an outcome (possibly after an
+    // earlier fallback line) and stays, with the new line after it. "The line it last wrote" comes from the
+    // row's own transitions, so no marker is stored in the text. When the row has closed since, the field may
+    // end with an outcome that reads like that line, so then only a field that is exactly the line (an
+    // appended outcome would make it longer) is replaced; with no such reroute transition the field is left whole.
+    const fallbackLine = `fallback: ${reason}`;
+    const start = qitem.resolution ? this.fallbackLineStart(qitemId, qitem.resolution) : null;
+    const kept = qitem.resolution && start !== null ? qitem.resolution.slice(0, Math.max(0, start - 1)) : qitem.resolution;
+    const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
+
     const txn = this.db.transaction(() => {
       this.db
         .prepare(
@@ -3806,7 +3950,7 @@ export class QueueRepository {
                  resolution = ?
            WHERE qitem_id = ?`
         )
-        .run(fallbackDestination, ts, newChain, `fallback: ${reason}`, qitemId);
+        .run(fallbackDestination, ts, newChain, nextResolution, qitemId);
       // A park timer targets the owner that parked the row. Once the row belongs to someone else it must not keep
       // waking the old owner, so it ends here like any other exit from the park. A repeating wait is left running:
       // it resolves its recipient from the row's current owner at delivery (evaluateQueueWait).
@@ -3817,7 +3961,7 @@ export class QueueRepository {
       this.transitionLog.append({
         qitemId,
         state: qitem.state,
-        actorSession: "system:queue-fallback",
+        actorSession: FALLBACK_ACTOR,
         transitionNote: `fallback-routed: ${originalDestination} → ${fallbackDestination} (${reason})`,
         closureTarget: qitem.state === "in-progress" ? this.retainedClaimBlocker(qitemId) : undefined,
       });
@@ -3952,9 +4096,9 @@ export class QueueRepository {
   }
 
   private handoffAdvisory(row: QueueItemRow): QueueItem["handoffAdvisory"] {
-    // handoff() creates its local successor in the same transaction. Do not
-    // scan successor history again on every projection of those source rows.
-    if (row.state === "handed-off" || !isTerminalState(row.state)
+    // Generic updates can write handed-off and retain a previous handoff's owner
+    // after reopening. Skip only when that owner still matches this closure.
+    if ((row.state === "handed-off" && matchesRecordedHandoffTarget(row.qitem_id, row.handed_off_to, row.closure_target)) || !isTerminalState(row.state)
       || row.closure_reason !== "handed_off_to" || !row.closure_target) return undefined;
     const target = row.closure_target;
     try {

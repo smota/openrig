@@ -153,6 +153,15 @@ describe("SettingsStore (User Settings v0)", () => {
       "snapshots.periodic.retention_keep",
       // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
       "terminal.status_bar",
+      // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
+      "output.compact",
+      // Slice 15 P5 — the whoami peer bound under output.compact.
+      "output.whoami_peers",
+      // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
+      "provider.usage_windows",
+      "usage.pi_cost_facts",
+      "usage.pi_openrouter_charge",
+      "transport.verify_input_box",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
@@ -195,6 +204,16 @@ describe("SettingsStore (User Settings v0)", () => {
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new SettingsStore(configPath);
     expect(store.resolveOne("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults output.whoami_peers to 8 and accepts only an integer >= 1 (slice 15 P5)", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("output.whoami_peers")).toMatchObject({ value: 8, source: "default" });
+    store.set("output.whoami_peers", "12");
+    expect(store.resolveOne("output.whoami_peers")).toMatchObject({ value: 12, source: "file" });
+    for (const raw of ["0", "-3", "2.5", "8junk", "many"]) {
+      expect(() => store.set("output.whoami_peers", raw)).toThrow(/output\.whoami_peers/);
+    }
   });
 
   it("resolves mutable 95/99 context-pressure thresholds and rejects invalid order", () => {
@@ -340,6 +359,23 @@ describe("SettingsStore (User Settings v0)", () => {
     process.env.OPENRIG_ONBOARDING_DEFAULT_PACK_ENABLED = "true";
     expect(store.resolveOne("onboarding.default_pack.enabled"))
       .toMatchObject({ value: true, source: "env", defaultValue: true });
+  });
+
+  it("transport.verify_input_box is off by default and resolves file, then env", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("transport.verify_input_box"))
+      .toMatchObject({ value: false, source: "default", defaultValue: false });
+
+    store.set("transport.verify_input_box", "true");
+    expect(store.resolveOne("transport.verify_input_box")).toMatchObject({ value: true, source: "file" });
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).transport).toEqual({ verifyInputBox: true });
+
+    try {
+      process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX = "0";
+      expect(store.resolveOne("transport.verify_input_box")).toMatchObject({ value: false, source: "env" });
+    } finally {
+      delete process.env.OPENRIG_TRANSPORT_VERIFY_INPUT_BOX;
+    }
   });
 
   it("env > file > default for daemon.port", () => {

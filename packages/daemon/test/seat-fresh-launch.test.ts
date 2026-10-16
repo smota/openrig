@@ -9,6 +9,7 @@ import { NodeLauncher } from "../src/domain/node-launcher.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
 import { getNodeInventory } from "../src/domain/node-inventory.js";
+import { PsProjectionService } from "../src/domain/ps-projection.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { ProjectionPlan } from "../src/domain/projection-planner.js";
@@ -597,6 +598,42 @@ describe("SeatLifecycleService.launchFresh", () => {
     expect(tmux.startServer).not.toHaveBeenCalled();
   });
 
+  it.each(["probe failure", "collision"])("keeps a refused replacement degraded after stopping its occupant: %s", async (mode) => {
+    const seat = seedSeat();
+    sessionRegistry.updateStartupStatus(seat.session!.id, "ready");
+    const sibling = rigRepo.addNode(seat.rig.id, "dev.qa", { runtime: "claude-code", cwd: "/sibling" });
+    const siblingSession = sessionRegistry.registerSession(sibling.id, "dev-qa@fresh-rig");
+    sessionRegistry.updateStatus(siblingSession.id, "running");
+    sessionRegistry.updateStartupStatus(siblingSession.id, "ready");
+    sessionRegistry.updateBinding(sibling.id, { attachmentType: "tmux", tmuxSession: siblingSession.sessionName, tmuxPane: "%qa" });
+    alive.add(siblingSession.sessionName);
+    livePanes.set(siblingSession.sessionName, "%qa");
+    // This hook runs after the managed occupant was killed, before the final probe.
+    vi.mocked(tmux.startServer).mockImplementationOnce(async () => {
+      if (mode === "collision") {
+        alive.add(seat.sessionName);
+        livePanes.set(seat.sessionName, "%unmanaged");
+      } else {
+        vi.mocked(tmux.probeSession).mockResolvedValueOnce({ state: "transport_unavailable", cause: "final probe failed" });
+      }
+      return { ok: true };
+    });
+
+    const result = await service.launchFresh({ seatRef: seat.sessionName, fresh: true, stop: true, reason: "replace occupant" });
+    expect(result).toMatchObject({ ok: false, code: mode === "collision" ? "unmanaged_session_collision" : "tmux_probe_failed" });
+    expect(killed).toEqual([seat.sessionName]);
+    expect(alive.has(siblingSession.sessionName)).toBe(true);
+    expect(tmux.createSession).not.toHaveBeenCalled();
+    expect(sessionRegistry.getBindingForNode(seat.node.id)).toBeNull();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE node_id = ?").get(seat.node.id)).toEqual({ count: 1 });
+    expect(getNodeInventory(db, seat.rig.id).find((entry) => entry.nodeId === seat.node.id)).toMatchObject({
+      sessionStatus: "exited", intentionallyStopped: false,
+    });
+    expect(new PsProjectionService({ db }).getEntries().find((entry) => entry.rigId === seat.rig.id)).toMatchObject({
+      lifecycleState: "degraded", status: "partial", nodeCount: 2, runningCount: 1,
+    });
+  });
+
   // Real tmux ends its server when the last session goes (exit-empty), and a
   // probe then fails "no server running": transport_unavailable, never absence.
   // new-session and startServer() each bring a server back.
@@ -806,6 +843,21 @@ describe("SeatLifecycleService.launchFresh", () => {
       occupantLifecycle: "active",
       startupStatus: "ready",
     });
+  });
+
+  it("OPR.0.7.0.7: a fresh launch sends the seat's saved effort choice over its authored effort, and records it", async () => {
+    const seat = seedSeat({ clean: true, runtime: "codex", model: "gpt-5.6-codex" });
+    rigRepo.setNodeEffort(seat.node.id, "medium");
+    rigRepo.setNodeEffortChoice(seat.node.id, "high");
+    harnessResult = { ok: true, resumeToken: "codex-fresh-uuid", resumeType: "codex_thread_id" };
+    paneCommand = "codex";
+
+    const result = await service.launchFresh({ seatRef: "dev.impl", fresh: true, reason: "apply effort" });
+
+    expect(result).toMatchObject({ ok: true, effort: "high" });
+    expect(launchBinding).toMatchObject({ effort: "high" });
+    const event = db.prepare("SELECT payload FROM events WHERE type = 'seat.fresh_launched' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
+    expect(JSON.parse(event.payload)).toMatchObject({ effort: "high" });
   });
 
   it("launches a Codex seat through the same fresh-only path without a resume carrier", async () => {
