@@ -156,3 +156,77 @@ export function readCodexEffectiveModel(rolloutPath: string, maxScanBytes = MAX_
     closeSync(fd);
   }
 }
+
+/** The Pi runtime's effective model per its NEWEST assistant record, in the
+ *  pinned `provider/id` form — the same shape `modelsMatch` compares against.
+ *  Reads the runtime's OWN record of what answered (the session entry's
+ *  `model`), not the requested echo; the raw API `responseModel` is NOT used
+ *  for the match because a routed/dated variant would false-diverge (the
+ *  detector canonicalises only the pinned, not the effective). Scans backward
+ *  from EOF in tail-sized windows up to MAX_SCAN_BYTES (the codex shape): a
+ *  large tool result can push the last assistant record past a single tail
+ *  window, which would otherwise leave the read stuck at unknown. null when
+ *  no model-bearing assistant record is in the scan (honest UNKNOWN). */
+export function readPiEffectiveModel(sessionFile: string, maxScanBytes = MAX_SCAN_BYTES): string | null {
+  let fd: number;
+  try {
+    fd = openSync(sessionFile, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    const scanFloor = Math.max(0, size - maxScanBytes);
+    let end = size;
+    while (end > scanFloor) {
+      const start = Math.max(scanFloor, end - TAIL_BYTES);
+      const buf = Buffer.alloc(end - start);
+      readSync(fd, buf, 0, buf.length, start);
+      const lines = buf.toString("utf-8").split("\n");
+      // The first line may be a record's TAIL cut at the window boundary. Drop it here — and size
+      // the next window to END just past that fragment, so the straddling record is re-read WHOLE
+      // from its own line start. (Same fragment-sizing as the codex scan.)
+      let droppedBytes = 0;
+      if (start > 0 && lines.length > 0) {
+        droppedBytes = Buffer.byteLength(lines[0]!, "utf-8");
+        lines.shift();
+      }
+      const model = newestPiModel(lines);
+      if (model !== null) return model;
+      if (start === scanFloor) break;
+      const next = start + droppedBytes + 1;
+      end = next < end ? next : start;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Newest `${provider}/${model}` (or bare `model`) from a Pi `type:"message"`
+ *  assistant record in `lines`, scanning backward. The `model` field is the
+ *  effective (the runtime's own record); `responseModel` is deliberately not
+ *  read (a routed/dated API variant would false-diverge). */
+function newestPiModel(lines: string[]): string | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    // Only an assistant record carries the effective model; skip the rest.
+    if (!line.includes('"assistant"') || (!line.includes('"model"') && !line.includes('"provider"'))) continue;
+    try {
+      const obj = JSON.parse(line) as {
+        type?: unknown;
+        message?: { role?: unknown; model?: unknown; provider?: unknown };
+      };
+      if (obj.type !== "message" || obj.message?.role !== "assistant") continue;
+      const provider = typeof obj.message.provider === "string" ? obj.message.provider : null;
+      const model = typeof obj.message.model === "string" && obj.message.model.length > 0 ? obj.message.model : null;
+      if (provider && model) return `${provider}/${model}`;
+      if (model) return model;
+    } catch {
+      /* corrupt line — keep scanning */
+    }
+  }
+  return null;
+}
