@@ -65,6 +65,13 @@ export interface PiRunnerState {
   sessionId?: string;
   /** Durable catch-up cursor: last session-entry id projected to the bus. */
   lastEntryId?: string;
+  /** History-integrity status of the startup catch-up (get_entries since the
+   *  carried cursor), reported SEPARATELY from `ready` (process readiness).
+   *  Absent = no catch-up was requested. A failed/absent entry (Pi's
+   *  "Entry not found" for a missing cursor) is a history miss, not a process
+   *  failure, so `ready` is left untouched. Terminal: a later cursor refresh
+   *  does not overwrite a resolved value. */
+  catchUp?: { status: "pending" | "ok" | "failed"; since: string; error?: string };
   /** ISO timestamp of the last sidecar write. */
   updatedAt: string;
   /** Set when the pi process exited; the seat is honestly non-running. */

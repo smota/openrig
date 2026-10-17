@@ -696,3 +696,53 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e5");
   });
 });
+
+// ── #524 / A1: history integrity (catch-up) reported SEPARATELY from process ready ─
+// The bug: a failed catch-up (Pi's "Entry not found" for a missing cursor, or any
+// RPC error) left `ready` untouched — indistinguishable from a success. The fix adds
+// a SEPARATE `catchUp` signal to the sidecar so a launch can gate on history integrity
+// without folding a benign history miss into process readiness.
+
+describe("history integrity (catch-up) is a separate signal from process ready (#524 / A1)", () => {
+  function catchUpCore(since: string) {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: since });
+    core.start();
+    return { core, ...f };
+  }
+  const getState = JSON.stringify({ type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE } });
+
+  it("a catch-up request marks the sidecar pending (on the first sidecar write), ready untouched", () => {
+    const { core, sidecars } = catchUpCore("entry-42");
+    core.handlePiLine(getState); // first sidecar write carries the pending catch-up
+    expect(sidecars.at(-1)!.catchUp).toEqual({ status: "pending", since: "entry-42" });
+    expect(sidecars.at(-1)!.ready).toBe(true);
+  });
+
+  it("a successful catch-up resolves ok and leaves ready untouched", () => {
+    const { core, sidecars } = catchUpCore("entry-42");
+    core.handlePiLine(getState);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-catch-up", entries: [{ id: "e1" }] }));
+    expect(sidecars.at(-1)!.catchUp).toEqual({ status: "ok", since: "entry-42" });
+    expect(sidecars.at(-1)!.ready).toBe(true);
+  });
+
+  it("a failed catch-up (Entry not found) reports failed WITHOUT flipping ready — the fix", () => {
+    const { core, sidecars } = catchUpCore("entry-42");
+    core.handlePiLine(getState); // process ready first
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-catch-up", success: false, error: "Entry not found: entry-42" }));
+    // catchUp is reported on the runner core (and via postActivity), not the
+    // sidecar — a sidecar write on error would zero the constructor-seeded
+    // lastEntryId, fabricating a cursor no reply established.
+    expect(core.catchUp).toEqual({ status: "failed", since: "entry-42", error: "Entry not found: entry-42" });
+    expect(sidecars.at(-1)!.ready).toBe(true); // a history miss is NOT a process failure
+  });
+
+  it("a failed catch-up is terminal — a later cursor refresh does not clear it", () => {
+    const { core, sidecars } = catchUpCore("entry-42");
+    core.handlePiLine(getState);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-catch-up", success: false, error: "Entry not found: entry-42" }));
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-cursor-refresh", entries: [{ id: "e9" }] }));
+    expect(sidecars.at(-1)!.catchUp).toEqual({ status: "failed", since: "entry-42", error: "Entry not found: entry-42" });
+  });
+});

@@ -380,6 +380,13 @@ export class RunnerCore {
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
+  /** History-integrity status of the startup catch-up (get_entries since the
+   *  carried cursor), reported SEPARATELY from `ready` (process readiness).
+   *  Additive: a failed/absent catch-up never flips `ready`, so launch and
+   *  resume wait only on process readiness. Terminal: resolved once by the
+   *  catch-up reply; a later cursor refresh does not overwrite it. Absent
+   *  until a catch-up is requested. */
+  private catchUp: { status: "pending" | "ok" | "failed"; since: string; error?: string } | null = null;
   private ready = false;
   private assistantErrorShown = false;
   private started = false;
@@ -449,6 +456,11 @@ export class RunnerCore {
       // runner instance had not yet projected. Mirror-only; activity states
       // are live-only signals.
       this.io.sendRpc({ type: "get_entries", since: this.opts.catchUpSince, id: CATCH_UP_ID });
+      // History integrity is tracked on its OWN signal, pending until the
+      // catch-up reply resolves it (ok/failed). `ready` is untouched either
+      // way — a failed/absent catch-up is a history miss, not a process
+      // failure (Pi's "Entry not found" for a missing cursor).
+      this.catchUp = { status: "pending", since: this.opts.catchUpSince };
     }
   }
 
@@ -563,6 +575,18 @@ export class RunnerCore {
         if (this.runtime === "omp") this.io.stopChild?.();
         return;
       }
+      if (record.id === CATCH_UP_ID && this.catchUp) {
+        // A failed/absent catch-up is a HISTORY miss (Pi's "Entry not found"
+        // for a missing cursor, or any RPC error), not a process failure.
+        // Report it on its OWN signal; leave `ready` (process) untouched. It
+        // is terminal: a later cursor refresh does not overwrite it.
+        this.catchUp = { ...this.catchUp, status: "failed", error: detail };
+        // No sidecar write. The catch-up integrity state is reported via
+        // postActivity. A sidecar write here would either: (1) zero the
+        // constructor-seeded lastEntryId (fabricated cursor), or (2) overwrite
+        // a prior get_state/cursor-refresh sidecar that carries the real
+        // cursor — also fabricating a position no reply established.
+      }
       this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
       // Only a rejected input means the seat cannot do the requested work.
       // A mistimed /abort (or any control command) leaves the seat idle.
@@ -597,6 +621,13 @@ export class RunnerCore {
         : undefined;
       if (lastId) {
         this.lastEntryId = lastId;
+        this.writeSidecar({});
+      }
+      // Catch-up resolved: the round-trip succeeded, so history integrity is
+      // ok. Only the catch-up reply sets this; a cursor refresh never does
+      // (and a prior "failed" is terminal — do not overwrite it).
+      if (record.id === CATCH_UP_ID && this.catchUp && this.catchUp.status === "pending") {
+        this.catchUp = { status: "ok", since: this.catchUp.since };
         this.writeSidecar({});
       }
       this.reportUsageFacts(entries);
@@ -804,17 +835,26 @@ export class RunnerCore {
   }
 
   private writeSidecar(patch: Partial<PiRunnerState>): void {
-    this.io.writeSidecar({
+    const record: Record<string, unknown> = {
       ready: this.ready,
       // Launch-attempt scope: every write is stamped so the daemon can
       // distinguish THIS runner instance's truth from stale artifacts.
       launchId: this.identity.launchId,
       sessionFile: this.sessionFile,
       sessionId: this.sessionId,
-      lastEntryId: this.lastEntryId,
       updatedAt: this.io.now(),
       ...patch,
-    });
+    };
+    // Only include cursor and catch-up when they have real values.
+    if (this.catchUp) record.catchUp = this.catchUp;
+    if (Object.hasOwn(patch, "lastEntryId")) {
+      // Explicitly set by caller (e.g. explicit undefined to zero).
+      record.lastEntryId = patch.lastEntryId;
+    } else if (this.lastEntryId) {
+      // Not in patch: carry the real cursor from get_state / refresh.
+      record.lastEntryId = this.lastEntryId;
+    }
+    this.io.writeSidecar(record as unknown as PiRunnerState);
   }
 }
 

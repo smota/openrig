@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   readClaudeEffectiveModel,
   readCodexEffectiveModel,
+  readPiEffectiveModel,
   readTailLines,
 } from "../src/domain/model-divergence/effective-model-readers.js";
 
@@ -152,5 +153,57 @@ describe("readTailLines", () => {
     const lines = readTailLines(p, 7); // lands mid-"bbbb"
     expect(lines).not.toContain("aaaa");
     expect(lines).toContain("cccc");
+  });
+});
+
+// #524 / B1 — Pi runtime effective-model read: the runtime's OWN record of what
+// answered (the session entry's `model`), in the pinned `provider/id` form, read
+// the same way the detector compares it — NOT the requested echo, NOT the raw
+// API `responseModel` (a routed/dated variant would false-diverge).
+
+const piLine = (model: string, provider = "grok") =>
+  JSON.stringify({ type: "message", message: { role: "assistant", provider, model, usage: { input: 1, output: 1 } } });
+
+describe("readPiEffectiveModel", () => {
+  it("returns the NEWEST assistant turn's model as provider/model", () => {
+    const p = tmp("t.jsonl", [
+      piLine("grok-4"),
+      JSON.stringify({ type: "message", message: { role: "user", content: "q" } }),
+      piLine("fable-5", "anthropic"),
+      "",
+    ].join("\n"));
+    expect(readPiEffectiveModel(p)).toBe("anthropic/fable-5");
+  });
+
+  it("reads `model` (the effective), never `responseModel` (a routed/dated variant would false-diverge)", () => {
+    const p = tmp("t.jsonl", [
+      JSON.stringify({ type: "message", message: { role: "assistant", provider: "grok", model: "grok-4", responseModel: "grok-4-2026-01-01" } }),
+      "",
+    ].join("\n"));
+    expect(readPiEffectiveModel(p)).toBe("grok/grok-4");
+  });
+
+  it("falls back to a bare `model` when the provider field is absent", () => {
+    const p = tmp("t.jsonl", JSON.stringify({ type: "message", message: { role: "assistant", model: "grok-4" } }) + "\n");
+    expect(readPiEffectiveModel(p)).toBe("grok-4");
+  });
+
+  it("a transcript with NO assistant turn reads null (pending, never assumed)", () => {
+    const p = tmp("t.jsonl", JSON.stringify({ type: "message", message: { role: "user", content: "boot" } }) + "\n");
+    expect(readPiEffectiveModel(p)).toBeNull();
+  });
+
+  it("missing file reads null; corrupt lines are skipped", () => {
+    expect(readPiEffectiveModel("/nonexistent/t.jsonl")).toBeNull();
+    const p = tmp("t.jsonl", "{not json \"assistant\" \"model\"\n" + piLine("grok-4") + "\n");
+    expect(readPiEffectiveModel(p)).toBe("grok/grok-4");
+  });
+
+  it("BOUNDED: a signal past one tail window still resolves via the backward scan (codex shape)", () => {
+    const p = tmp("t.jsonl", "");
+    // ~2MB of padding, then the signal — beyond a single 512KB tail window.
+    for (let i = 0; i < 2000; i++) appendFileSync(p, JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(1000) } }) + "\n");
+    appendFileSync(p, piLine("grok-4") + "\n");
+    expect(readPiEffectiveModel(p)).toBe("grok/grok-4");
   });
 });
