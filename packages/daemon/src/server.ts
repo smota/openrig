@@ -851,6 +851,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/provider", providerRoutes());
   app.route("/api/environments", environmentRoutes);
   app.route("/api/seat", seatRoutes);
+  app.route("/api/seats", seatRoutes);
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());

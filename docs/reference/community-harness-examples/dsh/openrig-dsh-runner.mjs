@@ -10,7 +10,7 @@
 // own.
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -195,6 +195,35 @@ class Activity {
   flushed() { return this.#chain; }
 }
 
+/** Consume complete appended lines once; watching is only a hint, polling also catches missed events. */
+export function tailCommands(path, handle) {
+  if (!path) return () => {};
+  let offset = 0;
+  let partial = Buffer.alloc(0);
+  let chain = Promise.resolve();
+  let watcher;
+  const read = () => {
+    let bytes;
+    try { bytes = readFileSync(path); } catch { return; }
+    if (bytes.length <= offset) return; // the runner never truncates or rewinds the channel
+    partial = Buffer.concat([partial, bytes.subarray(offset)]);
+    offset = bytes.length;
+    let newline;
+    while ((newline = partial.indexOf(10)) !== -1) {
+      const line = partial.subarray(0, newline).toString("utf8");
+      partial = partial.subarray(newline + 1);
+      let command;
+      try { command = JSON.parse(line); } catch { continue; }
+      if (!command || typeof command.id !== "string" || !["wake", "cancel"].includes(command.type)) continue;
+      chain = chain.then(() => handle(command)).catch((error) => console.error(`openrig-dsh-runner: command failed: ${error.message}`));
+    }
+  };
+  try { watcher = watch(path, read); watcher.on("error", () => watcher.close()); } catch { /* polling remains active */ }
+  const poll = setInterval(read, 1_000);
+  read();
+  return () => { clearInterval(poll); watcher?.close(); };
+}
+
 const UPLOADS_OFF = [
   "# Written by openrig-dsh-runner for this seat; safe to edit, and an existing file is left alone.",
   "# Don't attach this seat's session log, or its plugin package names and versions, to DeepSeek API requests.",
@@ -281,6 +310,7 @@ async function main() {
   let heartbeat;
   let workBeat;
   let tty = false;
+  let stopCommands = () => {};
   // The turn may read working: it runs, nothing holds needs input, no permission request is being submitted or waits for its
   // permission_resolved, and dsh is alive. The beat and the agent's own reports both go by it.
   const working = () => state.running && !state.holding && state.asking === 0 && !state.resolvedAsk && !agentExited;
@@ -292,6 +322,7 @@ async function main() {
     try { process.stdin.setRawMode(false); } catch { /* already closed */ }
   };
   const finish = async (code) => {
+    stopCommands();
     clearInterval(heartbeat);
     clearInterval(workBeat);
     restoreTty();
@@ -307,7 +338,7 @@ async function main() {
     }
     await finish(code);
   };
-  const postIdle = (subtype) => activity.post("Stop", subtype, { livenessSeconds: LIVENESS_SECONDS });
+  const postIdle = (subtype) => activity.post("Stop", subtype, { livenessSeconds: LIVENESS_SECONDS, ...(subtype === "cancelled" ? { reason: "cancelled" } : {}) });
   const withdraw = (askId, reason) => track(callOpenRig("POST", `/api/activity/permission-requests/${encodeURIComponent(askId)}/withdraw`, { reason }, POST_TIMEOUT_MS));
 
   child.once("error", (error) => { agentExited = true; void fatal(`dsh couldn't be started (${error.message}); is it on PATH?`, 1); });
@@ -575,6 +606,16 @@ async function main() {
   say(`[openrig-dsh] ready · ${producer} · conversation ${state.sessionId}`);
   say(`[openrig-dsh] DSH_HOME ${home} · DSH_PERMISSION_MODE ${agentEnv.DSH_PERMISSION_MODE}`);
   say("[openrig-dsh] each submitted message is one prompt; /abort or Ctrl-C cancels the running turn");
+
+  stopCommands = tailCommands(env.OPENRIG_COMMAND_PATH, async (command) => {
+    if (command.type === "wake" && typeof command.question === "string") {
+      activity.post(undefined, undefined, { eventFamily: "wake_answer", id: command.id, answer: `dsh-awake: ${command.question}` });
+      await activity.flushed();
+    } else if (command.type === "cancel") {
+      if (state.running) abort();
+      else postIdle("cancelled");
+    }
+  });
 
   heartbeat = setInterval(() => { if (!state.running && !state.holding && !agentExited) postIdle("idle_heartbeat"); }, BEAT_MS);
   // While a turn runs and nothing waits on a person: the turn is still outstanding and dsh is alive. Not progress.

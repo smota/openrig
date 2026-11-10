@@ -27,6 +27,8 @@ import type { SessionTransport } from "../domain/session-transport.js";
 import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
 import { PERMISSIONS_DENY } from "../domain/runner-permissions.js";
 
+import { SeatCommandService } from "../domain/seat-command-service.js";
+
 export const seatRoutes = new Hono();
 
 // Slice 16: a runtime switch's retired predecessor, or its staged successor before commit, doesn't act as the seat here
@@ -634,4 +636,12 @@ seatRoutes.post("/switch-client/:seatRef", async (c) => {
   }
   // switch_failed / tmux_probe_failed — a tmux-layer failure, not a client error.
   return c.json(result, 502);
+});
+
+// Mounted at /api/seat and /api/seats; the same seat router owns the command channel.
+seatRoutes.post("/:sessionName/command", async c => {
+  const service = new SeatCommandService(c.get("sessionRegistry" as never) as SessionRegistry,
+    c.get("tmuxAdapter" as never) as TmuxAdapter);
+  const result = await service.command(c.req.param("sessionName"), await c.req.json().catch(() => null));
+  return c.json(result.body, result.status);
 });

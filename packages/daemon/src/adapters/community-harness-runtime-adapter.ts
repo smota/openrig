@@ -22,11 +22,12 @@ import { writeFirstInput, type FirstInputPassed } from "../domain/community-harn
 import type { CommunityHarnessPreset } from "../domain/community-harness-presets.js";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { createSeatCommandChannel } from "../domain/seat-command-service.js";
 import { shellQuote } from "./shell-quote.js";
 
 interface CommunityHarnessAdapterDeps {
   environmentStartup?: EnvironmentStartup;
-  tmux: Pick<TmuxAdapter, "hasSession" | "getPaneCommand" | "sendShellCommand">;
+  tmux: Pick<TmuxAdapter, "hasSession" | "getPaneCommand" | "sendShellCommand"> & Partial<Pick<TmuxAdapter, "getSessionEnv">>;
   seatLaunchEnvironment?: Pick<SeatLaunchEnvironment, "command" | "resolveLaunchWrapper">;
   presetsDir?: () => string;
   /** Where launch-result records go (tests); defaults to $OPENRIG_HOME/state/launch-results. */
@@ -148,6 +149,9 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     launcherPrefix = found.preset.runner && resolvedWrapper
       ? `/usr/bin/env OPENRIG_LAUNCH_WRAPPER=${shellQuote(JSON.stringify(resolvedWrapper))} ${launcherPrefix}`
       : `/usr/bin/env -u OPENRIG_LAUNCH_WRAPPER ${launcherPrefix}`;
+    if (found.preset.runner && !found.preset.commands) {
+      launcherPrefix = `/usr/bin/env -u OPENRIG_COMMAND_PATH ${launcherPrefix}`;
+    }
     // The first input counts as passed once typing began, as before. The model's dispatch is confirmed only by a send that
     // succeeded, which a later failure of the launch doesn't undo; typing that began and then failed leaves it uncertain;
     // a launch that failed before typing passed nothing.
@@ -174,11 +178,16 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     if (preset.launchResult) {
       try {
         attempt = newLaunchAttempt(session, this.deps.launchResultRoot?.() ?? launchResultRoot());
+        const commandPath = preset.commands ? createSeatCommandChannel(attempt, {
+          sessionName: session, nodeId: binding.nodeId,
+          generation: binding.launchGeneration ?? await this.deps.tmux.getSessionEnv?.(session, "OPENRIG_OCCUPANT_GENERATION") ?? "",
+        }, this.deps.launchResultRoot?.() ?? launchResultRoot()) : undefined;
         launcherPrefix = `/usr/bin/env OPENRIG_LAUNCH_RESULT=${shellQuote(attempt.file)} OPENRIG_LAUNCH_ATTEMPT=${attempt.attempt}`
+          + `${commandPath ? ` OPENRIG_COMMAND_PATH=${shellQuote(commandPath)}` : ""}`
           + `${resumeRef ? ` OPENRIG_RESUME_REF=${shellQuote(resumeRef)}` : ""} ${launcherPrefix}`;
       } catch (error) {
         // A resume needs its record: without it the launcher can't be told what to reopen, so nothing starts.
-        if (resumeRef) {
+        if (resumeRef || preset.commands) {
           return { ok: false, error: `Couldn't resume community harness "${this.runtime}": its launch-result folder couldn't be made (${(error as Error).message}); nothing was started.` };
         }
         storageNote = `community harness "${this.runtime}": its launch identity is unavailable: its launch-result folder couldn't be made (${(error as Error).message})`;

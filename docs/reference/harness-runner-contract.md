@@ -479,3 +479,34 @@ its pane. That covers:
    seat is still open.
 4. **For OpenRig:** once a second ACP harness exists, should one shared ACP runner live in OpenRig rather than one per
    harness?
+
+## Command channel
+
+A runner preset can declare `commands: true` (default false); this requires `runner: true`. For each launch, OpenRig
+creates an empty 0600 file at `<OPENRIG_HOME>/state/launch-results/commands/<attemptId>.jsonl` and prefixes
+`OPENRIG_COMMAND_PATH=<that path>` onto the runner command beside `OPENRIG_LAUNCH_RESULT`.
+
+The daemon appends one JSON line per command:
+
+```json
+{"type":"cancel","id":"<uuid>","at":"<iso>"}
+{"type":"wake","id":"<uuid>","at":"<iso>","question":"...","timeoutSeconds":60}
+```
+
+Tail this file with `fs.watch` and a one-second polling fallback. Process each complete line once, including lines
+appended before the watcher starts; keep an incomplete final line until its newline arrives. Never truncate the file.
+On cancel, request the harness's cancellation and post the normal `Stop` hook with reason `cancelled` when it completes.
+
+For a wake, post the answer to the existing `POST /api/activity/hooks`, using the runner's activity credentials:
+
+```json
+{"eventFamily":"wake_answer","id":"<command uuid>","answer":"...","sessionName":"<seat>","nodeId":"<node id>","generation":"<generation>","occurredAt":"<iso>"}
+```
+
+`POST /api/seats/:sessionName/command` accepts `{ "type": "cancel" }` or
+`{ "type": "wake", "question": "...", "timeoutSeconds": 60 }` (default 60 seconds, maximum 300). Cancel returns
+202 with `{ "ok": true, "id": "..." }`. Wake waits for the matching answer and returns 200 with `ok`, `id`,
+`answer` and `answeredAt`, or 504 `{ "error": "wake_timeout", "id": "..." }`. Pending answers live only in daemon
+memory; restarting it loses pending waits. Unknown seats return 404 `unknown_seat`; a runtime without this declaration
+returns 409 `no_command_channel` with detail `harness declares no command channel`; a missing live attempt or file
+returns 409 `not_running`. This channel adds no built-in runtime support.

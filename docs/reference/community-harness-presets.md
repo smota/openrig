@@ -21,7 +21,7 @@ it never reads an unsupported capability as idle, working, ready or verified.
 | Activity | partly | Read from the screen only; there are no activity hooks. Work and attention the screen shows are kept, but a screen that looks idle reads `unknown`, never idle, because a quiet prompt can be an approval or a pause. A [runner preset](#runner-presets-runner-true)'s own reports decide it instead. |
 | Attention | partly | Read from the screen: a permission question or numbered choice that OpenRig recognizes reads as needing attention, and `rig send` won't type into it. A prompt it doesn't recognize reads `unknown`. |
 | Approval | no | Approvals stay in the harness's own pane. OpenRig relays none, so a person answers them there. A [runner preset](#runner-presets-runner-true) is the exception: its runner submits the agent's permission requests to OpenRig, which asks a person, and the default is permit (section 7 of the [harness and runner contract](harness-runner-contract.md)). |
-| Cancel | no | OpenRig has no verb that cancels a running turn. `rig seat stop` and `rig down` end the seat's tmux session; anything the harness runs outside its pane, such as a gateway, is its own, and the preset's `limits` should say what keeps running. Restarting in place and switching harness are refused. |
+| Cancel | when declared | With `commands: true`, `rig seat cancel <sessionName>` requests cancellation through the runner. Other community harnesses declare no command channel. `rig seat stop` and `rig down` end the seat's tmux session; anything the harness runs outside its pane, such as a gateway, is its own, and the preset's `limits` should say what keeps running. Restarting in place and switching harness are refused. |
 | Transport | yes | The seat is a tmux pane like any other, so `rig capture`, `rig send` and `--host` work as they do for any seat. |
 
 **Not placed:** guidance, skills and startup files (a launch warns that they weren't delivered), and the model: set it in the harness's own
@@ -52,6 +52,7 @@ resume: true                    # optional, needs one of those two; declare it o
 startup_assisted: true           # optional: startup submission needs a person's check (below)
 first_input: true                # optional: launcher takes the first turn from OPENRIG_FIRST_INPUT (below)
 # runner: true                  # optional, needs launch_result: the launcher reports the seat's activity (below)
+# commands: true                # optional, needs runner: daemon-to-runner wake/cancel channel (below)
 # passes_model: true            # optional: the launcher takes the seat's declared model from OPENRIG_MODEL (below)
 # launch_wrapper: true          # optional: a runner applies OPENRIG_LAUNCH_WRAPPER to its native child (below)
 ```
@@ -315,7 +316,7 @@ Its [README](community-harness-examples/dsh/README.md) has the setup and a check
 and maintain them as your own.
 
 The launcher is the contributor's code, in the contributor's package. OpenRig runs no code from a preset and loads no
-module into its daemon. A preset that sets `launch_result`, `names_conversation`, `startup_assisted`, `first_input`, `runner` or `passes_model` is refused by an older
+module into its daemon. A preset that sets `launch_result`, `names_conversation`, `startup_assisted`, `first_input`, `runner`, `commands` or `passes_model` is refused by an older
 OpenRig that doesn't know the field.
 
 ## Pass the first startup input at launch
@@ -453,3 +454,14 @@ What the maintainers look at:
 5. **It's maintained:** a named maintainer, and a launcher that keeps working with the harness's current release.
 
 There's no score or threshold. The maintainers weigh the evidence.
+
+## Command channel (`commands: true`)
+
+A format-1 preset may set `commands: true` (boolean, default false). It requires `runner: true`; otherwise the preset is
+refused with `commands needs runner: true: only a runner reads OPENRIG_COMMAND_PATH`. OpenRig creates a private, empty
+JSONL file per launch attempt and passes `OPENRIG_COMMAND_PATH` beside `OPENRIG_LAUNCH_RESULT`. The runner tails it for
+wake and cancel requests as described in the [Command channel contract](harness-runner-contract.md#command-channel).
+
+`rig seat cancel <sessionName>` appends a cancel request. `rig ask --wake <sessionName>` sends a question through the
+same channel and prints the runner's answer. A preset without this declaration, including built-in runtimes at this
+route, is refused with `harness declares no command channel`. A seat without a live attempt or channel is not running.

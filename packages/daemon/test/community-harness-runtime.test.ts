@@ -81,7 +81,7 @@ describe("community harness presets", () => {
   it("loads a preset with the fields this format reads", () => {
     const dir = presets({ "synth.yaml": GOOD });
     expect(loadCommunityHarnessPreset("synth", dir)).toEqual({ ok: true, preset: {
-      name: "synth", command: "synth-harness --serve", maintainer: "Example Maintainer", limits: ["resume unsupported"], launchResult: false, namesConversation: false, resume: false, startupAssisted: false, firstInput: false, runner: false, passesModel: false, launchWrapper: false, path: join(dir, "synth.yaml") } });
+      name: "synth", command: "synth-harness --serve", maintainer: "Example Maintainer", limits: ["resume unsupported"], launchResult: false, namesConversation: false, resume: false, startupAssisted: false, firstInput: false, runner: false, passesModel: false, launchWrapper: false, commands: false, path: join(dir, "synth.yaml") } });
   });
 
   it.each([
@@ -447,12 +447,12 @@ describe("the community harness adapter", () => {
     expect(COMMUNITY_HARNESS_RUNG_INVENTORY.rungs.some(r => r.rung === "lifecycle-hooks")).toBe(false);
   });
 
-  it("community contract: the adapter exposes no turn-cancel operation", () => {
+  it("community contract: turn-cancel reaches a runner only through the command channel, never the adapter", () => {
     const { app } = adapter(presets({ "synth.yaml": GOOD }));
     expect(Object.getOwnPropertyNames(Object.getPrototypeOf(app)).filter(name => /cancel|interrupt/i.test(name))).toEqual([]);
     const commands = seatCommand().commands.map(command => command.name());
     expect(commands).toContain("stop");
-    expect(commands.filter(name => /cancel|interrupt/i.test(name))).toEqual([]);
+    expect(commands).toContain("cancel");
   });
 
   it("community contract: a configured seat model neither changes the preset command nor writes harness settings", async () => {

@@ -4,7 +4,7 @@ import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-life
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { resolveIdentitySource } from "./whoami.js";
-import { runWake, defaultWakeRunner, defaultWakeFileLocator, type WakeRunner } from "../ask-wake.js";
+import { runWake, DEFAULT_WAKE_TIMEOUT_MS, defaultWakeRunner, defaultWakeFileLocator, type WakeRunner } from "../ask-wake.js";
 
 interface AskRigInfo {
   name: string;
@@ -168,6 +168,32 @@ Exit codes:
         }
         const resolution = res.data;
         if (!resolution.resolved) {
+          // The token resolver deliberately only supports built-in headless runtimes.
+          // A live community runner instead answers through the daemon's command route,
+          // which is the authority on whether its preset declares a channel.
+          if ((generation === undefined || generation === 1) && typeof client.get === "function") {
+            const status = await client.get<{ runtime?: string | null }>(`/api/seats/status/${encodeURIComponent(seat)}`);
+            const runtime = status.data.runtime;
+            if (status.status === 200 && runtime && !["claude", "claude-code", "codex", "pi", "omp", "terminal", "stub"].includes(runtime)) {
+              const timeoutSeconds = (timeoutMs ?? DEFAULT_WAKE_TIMEOUT_MS) / 1000;
+              if (timeoutSeconds > 300) {
+                console.error("Community command channels require --wake-timeout of at most 300 seconds.");
+                process.exitCode = 1;
+                return;
+              }
+              const wake = await client.post<{ ok?: boolean; id?: string; answer?: string; answeredAt?: string; error?: string; detail?: string }>(
+                `/api/seats/${encodeURIComponent(seat)}/command`, { type: "wake", question, timeoutSeconds },
+                { timeoutMs: timeoutSeconds * 1000 + 1000 });
+              if (opts.json) console.log(JSON.stringify(wake.data));
+              else if (wake.status >= 400) console.error(wake.data.error === "no_command_channel"
+                ? `${wake.data.detail ?? "harness declares no command channel"}. Enable commands: true in the community preset to use --wake.`
+                : wake.data.detail ?? wake.data.error);
+              else console.log(wake.data.answer ?? "");
+              if (wake.status >= 400) process.exitCode = 2;
+              return;
+            }
+          }
+
           console.error(resolution.reason);
           if (resolution.known && resolution.known.length > 0) {
             console.error("Known tenures for this seat (newest first):");

@@ -460,6 +460,21 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
   };
   const readStdin = depsOverride?.readStdin ?? defaultReadStdin;
 
+  cmd.command("cancel").argument("<sessionName>")
+    .option("--json", "Print the daemon response as JSON")
+    .description("Cancel a running community runner through its command channel")
+    .action(async (sessionName: string, opts: { json?: boolean }) => {
+      const deps = getDeps();
+      const daemon = await getDaemonStatus(deps.lifecycleDeps);
+      if (!daemonStatusGuard(daemon)) return;
+      const result = await deps.clientFactory(getDaemonUrl(daemon)).post<{ ok?: boolean; id?: string; error?: string; detail?: string }>(
+        `/api/seats/${encodeURIComponent(sessionName)}/command`, { type: "cancel" });
+      if (opts.json) console.log(JSON.stringify(result.data));
+      else if (result.status >= 400) console.error(result.data.detail ?? result.data.error);
+      else console.log(`Cancel requested for ${sessionName}: ${result.data.id}`);
+      if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
+    });
+
   const guardRequest = async (method: "GET" | "POST", path: string, body: Record<string, unknown> | undefined, json?: boolean) => {
     const deps = getDeps(); const daemon = await getDaemonStatus(deps.lifecycleDeps);
     if (!daemonStatusGuard(daemon)) return;

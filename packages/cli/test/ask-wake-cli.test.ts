@@ -73,6 +73,65 @@ function makeCmd(deps: StatusDeps): Command {
 }
 
 describe("rig ask --wake (L3 CLI)", () => {
+  it.each([false, true])("routes a community wake through its daemon channel (json=%s)", async json => {
+    const runner: WakeRunner = vi.fn();
+    const deps = seatDeps(runner, {});
+    const post = vi.fn(async (path: string) => path === "/api/wake-resolve"
+      ? { status: 200, data: { resolved: false, reason: "unsupported runtime", known: [] } }
+      : { status: 200, data: { ok: true, id: "wake-id", answer: "runner answer", answeredAt: "2026-11-10T00:00:00Z" } });
+    deps.clientFactory = () => ({ post, get: async () => ({ status: 200, data: { runtime: "dsh" } }) }) as never;
+    const { logs, exitCode } = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "my-rig", "q", "--wake", "dev@my-rig", "--wake-timeout", "5", ...(json ? ["--json"] : [])]).then(() => {}));
+    expect(post).toHaveBeenCalledWith("/api/seats/dev%40my-rig/command", { type: "wake", question: "q", timeoutSeconds: 5 }, { timeoutMs: 6000 });
+    expect(logs.join(" ")).toContain("runner answer");
+    if (json) expect(JSON.parse(logs[0]!)).toMatchObject({ ok: true, answer: "runner answer" });
+    expect(runner).not.toHaveBeenCalled();
+    expect(exitCode).toBeUndefined();
+  });
+
+
+  it.each([
+    [409, "no_command_channel", "commands: true"],
+    [409, "not_running", "not_running"],
+    [404, "unknown_seat", "unknown_seat"],
+    [504, "wake_timeout", "wake_timeout"],
+  ])("reports community wake HTTP %s %s without local execution", async (status, error, message) => {
+    const runner: WakeRunner = vi.fn();
+    const deps = seatDeps(runner, {});
+    const post = vi.fn(async (path: string) => path === "/api/wake-resolve"
+      ? { status: 200, data: { resolved: false, reason: "unsupported runtime", known: [] } }
+      : { status, data: { error, id: "wake-id", ...(error === "no_command_channel" ? { detail: "harness declares no command channel" } : {}) } });
+    deps.clientFactory = () => ({ post, get: async () => ({ status: 200, data: { runtime: "dsh" } }) }) as never;
+    const { logs, exitCode } = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "my-rig", "q", "--wake", "dev@my-rig"]).then(() => {}));
+    expect(logs.join(" ")).toContain(message);
+    expect(exitCode).toBe(2);
+    expect(runner).not.toHaveBeenCalled();
+    expect(post).toHaveBeenLastCalledWith("/api/seats/dev%40my-rig/command", { type: "wake", question: "q", timeoutSeconds: 180 }, { timeoutMs: 181000 });
+  });
+
+  it("never sends a historical community tenure to the live channel", async () => {
+    const runner: WakeRunner = vi.fn();
+    const deps = seatDeps(runner, { resolved: false, reason: "unsupported runtime", known: [] });
+    const get = vi.fn(async () => ({ status: 200, data: { runtime: "dsh" } }));
+    const post = (deps as unknown as { __post: ReturnType<typeof vi.fn> }).__post;
+    deps.clientFactory = () => ({ post, get }) as never;
+    const { exitCode } = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "my-rig", "q", "--wake", "dev@my-rig@2"]).then(() => {}));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
+    expect(exitCode).toBe(2);
+  });
+
+  it("rejects a community timeout above the channel limit without posting a wake", async () => {
+    const runner: WakeRunner = vi.fn();
+    const deps = seatDeps(runner, { resolved: false, reason: "unsupported runtime", known: [] });
+    const post = (deps as unknown as { __post: ReturnType<typeof vi.fn> }).__post;
+    deps.clientFactory = () => ({ post, get: async () => ({ status: 200, data: { runtime: "dsh" } }) }) as never;
+    const { logs, exitCode } = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "my-rig", "q", "--wake", "dev@my-rig", "--wake-timeout", "301"]).then(() => {}));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(logs.join(" ")).toContain("at most 300 seconds");
+    expect(exitCode).toBe(1);
+  });
+
   it("help distinguishes full seat targets from runtime IDs and titles", () => {
     const runner: WakeRunner = vi.fn();
     const cmd = askCommand(tokenDeps(runner));

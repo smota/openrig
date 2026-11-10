@@ -4,6 +4,7 @@ name: dsh
 command: openrig-dsh-runner.mjs
 maintainer: Your name or team
 runner: true
+commands: true
 launch_result: true
 first_input: true
 limits:

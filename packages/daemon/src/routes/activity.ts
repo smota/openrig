@@ -1,3 +1,4 @@
+import { SeatCommandService } from "../domain/seat-command-service.js";
 import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
 import { SessionRegistry, physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
@@ -339,6 +340,11 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
         .run(stringOrNull(body.runtime), body.sessionId, switchRole.id);
     }
     return c.json({ ok: true, ignored: switchRole.role, switchId: switchRole.id, tokenPersisted: false });
+  }
+
+  if (body.eventFamily === "wake_answer") {
+    const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    return c.json({ ok: true, resolved: registry ? new SeatCommandService(registry).resolveWakeAnswer(body) : false });
   }
 
   if (body.eventFamily === "session_identity") {
