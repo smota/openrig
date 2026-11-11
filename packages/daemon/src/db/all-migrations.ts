@@ -1,3 +1,4 @@
+import { coreAppAccessSchema } from "./migrations/163_core_app_access.js";
 import { piAccountSwitchesSchema } from "./migrations/151_pi_account_switches.js";
 import { workflowInstanceSpecSchema } from "./migrations/152_workflow_instance_spec.js";
 import { eventsRetentionMarksSchema } from "./migrations/153_events_retention_marks.js";
@@ -325,4 +326,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   queueItemsHandedOffFromIndexSchema,
   networkBindingsSchema,
   networkReceiptsSchema,
+  coreAppAccessSchema,
 ];
