@@ -1,3 +1,4 @@
+import { nodeInputRouteSchema } from "./migrations/164_node_input_route.js";
 import { runBoundActivityGrantsSchema } from "./migrations/162_run_bound_activity_grants.js";
 import { coreAppAccessSchema } from "./migrations/163_core_app_access.js";
 import { piAccountSwitchesSchema } from "./migrations/151_pi_account_switches.js";
@@ -329,4 +330,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   networkReceiptsSchema,
   runBoundActivityGrantsSchema,
   coreAppAccessSchema,
+  nodeInputRouteSchema,
 ];

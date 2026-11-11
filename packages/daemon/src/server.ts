@@ -2,6 +2,7 @@ import { CoreAppJob } from "./domain/core-app-job.js";
 import { MissionControlActionLog } from "./domain/mission-control/mission-control-action-log.js";
 import { coreAppRoutes } from "./routes/core-app.js";
 import { CoreAppAccess } from "./domain/core-app-access.js";
+import type { RunnerChannel } from "./domain/runner-channel.js";
 import { EnvironmentLifecycle } from "./domain/environment-lifecycle.js";
 import { EnvironmentPlatform, type EnvironmentDriver } from "./domain/environment-platform.js";
 import { OpenShellDriver } from "./adapters/openshell-driver.js";
@@ -155,6 +156,7 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  runnerChannel?: RunnerChannel;
   environmentDriver?: EnvironmentDriver;
   environmentArtifactRoot?: string;
   environmentStateRoot?: string;
@@ -623,6 +625,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("podBundleSourceResolver" as never, deps.podBundleSourceResolver);
     c.set("runtimeAdapters" as never, deps.runtimeAdapters ?? {});
     c.set("transcriptStore" as never, deps.transcriptStore);
+    c.set("runnerChannel" as never, deps.runnerChannel);
     c.set("sessionTransport" as never, deps.sessionTransport);
     c.set("askService" as never, deps.askService);
     c.set("wakeResolveService" as never, deps.wakeResolveService);
