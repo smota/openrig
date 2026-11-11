@@ -1,4 +1,6 @@
 import type { RunnerChannel } from "./domain/runner-channel.js";
+import { coreAppRoutes } from "./routes/core-app.js";
+import { CoreAppAccess } from "./domain/core-app-access.js";
 import { EnvironmentLifecycle } from "./domain/environment-lifecycle.js";
 import { EnvironmentPlatform, type EnvironmentDriver } from "./domain/environment-platform.js";
 import { OpenShellDriver } from "./adapters/openshell-driver.js";
@@ -870,6 +872,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/views", viewsRoutes());
   app.route("/api/watchdog", watchdogRoutes());
   app.route("/api/workflow", workflowRoutes());
+  app.route("/api/apps", coreAppRoutes({ access: deps.queueRepo ? new CoreAppAccess(deps.queueRepo.db, deps.queueRepo) : undefined, operatorToken: deps.missionControlBearerToken }));
   app.route(
     "/api/mission-control",
     missionControlRoutes({ bearerToken: deps.missionControlBearerToken ?? null }),
