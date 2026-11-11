@@ -1,3 +1,4 @@
+import { redactCoreAppSubmissions } from "./core-app-access.js";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, openSync, readSync, statSync } from "node:fs";
 import type Database from "better-sqlite3";
@@ -720,6 +721,7 @@ export async function eraseQueue(db: Database.Database, opts: EraseOptions): Pro
         eraseCopies(st, planned.owned.delete, "delete");
         const scrub = planned.rows.filter((row) => row.action === "scrub").map((row) => row.qitemId);
         const remove = [...planned.rows.filter((row) => row.action === "delete").map((row) => row.qitemId), ...planned.absent];
+        if (scrub.length > 0 || remove.length > 0) redactCoreAppSubmissions(db, [...scrub, ...remove], opts.nowIso);
         if (scrub.length > 0) scrubRows(st, scrub, opts.nowIso);
         if (remove.length > 0) deleteRows(st, remove, opts.nowIso, reason);
         return planned;
