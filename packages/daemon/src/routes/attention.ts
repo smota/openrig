@@ -1,3 +1,4 @@
+import { humanAskAttention } from "../domain/human-ask-attention.js";
 import { Hono } from "hono";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -40,13 +41,9 @@ export function attentionRoutes(): Hono {
     inView = view.inView;
     try {
       if (!queue) throw new Error("Queue repository unavailable");
-      const rows = queue.listAttention({ limit: 1001 });
-      result.sources.push({ source: "queue", state: rows.length >= 1001 ? "partial" : "available", detail: rows.length >= 1001 ? "Attention query reached 1001 rows; showing at most 1000." : "Open human-addressed requests and explicit human blockers; a human-gate tier alone is insufficient." });
-      // An ask to a person counts by its classification, the membership every attention reader shares (a registered person
-      // may be addressed as a seat or an alias), whatever happened to its Slack post.
-      const asked = new Set(rows.slice(0, 1000).filter(q => queue.isCurrentHumanAsk(q.qitemId)).map(q => q.qitemId));
-      const quiet = new Set(rows.slice(0, 1000).filter(q => asked.has(q.qitemId) && queue.humanAskWithoutAlert(q.qitemId)).map(q => q.qitemId));
-      const current = rows.slice(0, 1000).filter(q => isHumanSeatSessionRef(q.destinationSession) || asked.has(q.qitemId) || q.state === "blocked" && isHumanSeatSessionRef(q.blockedOn ?? ""));
+      const { current, asked, partial } = humanAskAttention(queue);
+      result.sources.push({ source: "queue", state: partial ? "partial" : "available", detail: partial ? "Attention query reached 1001 rows; showing at most 1000." : "Open human-addressed requests and explicit human blockers; a human-gate tier alone is insufficient." });
+      const quiet = new Set(current.filter(q => asked.has(q.qitemId) && queue.humanAskWithoutAlert(q.qitemId)).map(q => q.qitemId));
       // A person with no connector binding is asked on Steering and in the Feed only: nothing is posted to them in Slack.
       const people = queue.humanRegistry();
       const noConnector = (address: string | null | undefined): boolean => {
