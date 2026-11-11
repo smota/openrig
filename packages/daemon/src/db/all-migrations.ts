@@ -1,3 +1,4 @@
+import { nodeInputRouteSchema } from "./migrations/164_node_input_route.js";
 import { runBoundActivityGrantsSchema } from "./migrations/162_run_bound_activity_grants.js";
 import { piAccountSwitchesSchema } from "./migrations/151_pi_account_switches.js";
 import { workflowInstanceSpecSchema } from "./migrations/152_workflow_instance_spec.js";
@@ -327,4 +328,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   networkBindingsSchema,
   networkReceiptsSchema,
   runBoundActivityGrantsSchema,
+  nodeInputRouteSchema,
 ];
