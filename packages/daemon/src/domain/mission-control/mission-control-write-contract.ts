@@ -670,6 +670,7 @@ export class MissionControlWriteContract {
       // under the same envelope. An injected audit failure rolls back the choice too.
       if (input.appSubmission && unansweredQuestions(questions, { ...(ask.humanAnswers ?? {}), [input.questionId ?? ""]: input.optionId ?? "" }).length > 0) {
         return this.eventBus.withNotifyEnvelope(register => {
+          input.appSubmission!.verify();
           const recorded = this.queueRepo.recordHumanAnswer({ qitemId: input.qitemId, actorSession: input.actorSession,
             questionId: input.questionId ?? "", optionId: input.optionId ?? "", primaryUser });
           if (recorded.status !== "recorded") throw new MissionControlWriteContractError("answer_not_recorded", `The answer wasn't recorded: ${recorded.reason}.`);
@@ -680,6 +681,7 @@ export class MissionControlWriteContract {
         });
       }
       const recorded = this.db.transaction(() => {
+        input.appSubmission?.verify();
         const result = this.queueRepo.recordHumanAnswer({ qitemId: input.qitemId, actorSession: input.actorSession,
           questionId: input.questionId ?? "", optionId: input.optionId ?? "", primaryUser });
         if (result.status === "recorded") input.appSubmission?.checkpoint(this.queueRepo.getById(input.qitemId)!);
@@ -728,6 +730,7 @@ export class MissionControlWriteContract {
           ...(ask.tags ?? []).filter((t) => /^(project|mission|slice):/.test(t)),
           ...(operation ? [mcOperationTag(operation)] : []),
         ],
+        ...(input.appSubmission ? { verifyBeforeCreate: () => input.appSubmission!.verify() } : {}),
         inboundReplyTo: input.qitemId, ...(input.notify === false ? { nudge: false } : {}),
       });
     } catch (error) {
@@ -808,6 +811,7 @@ export class MissionControlWriteContract {
     let appResult: MissionControlActionResult | null = null;
     try {
       const persist = (register: NotifyRegister) => {
+        if (!outerRegister) input.appSubmission?.verify();
         if (closePending) {
           const closed = this.queueRepo.resolveDirectHumanReply({
             qitemId: input.qitemId,
