@@ -1400,18 +1400,22 @@ describe("managed run identity retries", () => {
 
 
 describe("managed Pi input and attributed wake", () => {
-  function managed(retain?: (body: Record<string, unknown>) => void, withdrawNativeTurn?: RunnerIo["withdrawNativeTurn"]) {
+  function managed(retain?: (body: Record<string, unknown>) => void | boolean, withdrawNativeTurn?: RunnerIo["withdrawNativeTurn"], preflightState?: (reply: () => void) => void) {
     const f = fakeIo(), posts: Record<string, unknown>[] = [];
     let nativeBusy = false, nativePendingCount = 0;
     const core = new RunnerCore({ ...f.io, withdrawNativeTurn, sendRpc: command => {
       f.rpc.push(command);
       if (command.type === "get_state" && (String(command.id).startsWith("openrig-native-idle-") || String(command.id).startsWith("openrig-cancel-state-")))
         queueMicrotask(() => core.handlePiLine(JSON.stringify({ type: "response", id: command.id, success: true, data: { isStreaming: nativeBusy, pendingMessageCount: nativePendingCount } })));
+      if (command.type === "get_state" && String(command.id).startsWith("openrig-cancel-preflight-")) {
+        const reply = () => core.handlePiLine(JSON.stringify({ type: "response", id: command.id, success: true, data: { isStreaming: nativeBusy, pendingMessageCount: nativePendingCount } }));
+        if (preflightState) preflightState(reply); else queueMicrotask(reply);
+      }
       if (command.type === "clear_queue") queueMicrotask(() => {
         nativePendingCount = 0; core.handlePiLine(JSON.stringify({ type: "queue_update", steering: [], followUp: [] }));
         core.handlePiLine(JSON.stringify({ type: "response", id: command.id, success: true }));
       });
-    }, postActivity: async body => { f.activity.push(body); return { tokenPersisted: true }; }, postRunner: async (body: Record<string, unknown>) => { posts.push(body); retain?.(body); return true; } },
+    }, postActivity: async body => { f.activity.push(body); return { tokenPersisted: true }; }, postRunner: async (body: Record<string, unknown>) => { posts.push(body); return retain?.(body) !== false; } },
       { sessionName: SESSION, runId: "run" });
     core.start(); core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", success: true, data: { sessionId: "native", isStreaming: false, pendingMessageCount: 0 } }));
     const frame = (id: string, sequence: number, kind: "input" | "wake") => ({ version: 1, requestId: id, runId: "run", sequence, kind,
@@ -1442,12 +1446,75 @@ describe("managed Pi input and attributed wake", () => {
     await f.core.acceptRunnerRequest(cancel);
     expect(f.rpc.filter(command => command.type === "abort")).toHaveLength(1);
   });
+  it.each(["steering", "followUp"] as const)("never writes global abort or clear for an unknown native %s queue and releases manual input", async family => {
+    const f = managed(undefined, async () => ({ confirmed: true })); f.core.handleUserBlock("owned E"); f.event("agent_start");
+    f.event("queue_update", { steering: family === "steering" ? ["UNKNOWN NATIVE"] : [], followUp: family === "followUp" ? ["UNKNOWN NATIVE"] : [] });
+    await f.core.acceptRunnerRequest({ version: 1, runId: "run", requestId: "unsafe", sequence: 1, kind: "cancel", payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc.filter(command => ["abort", "clear_queue"].includes(String(command.type)))).toEqual([]);
+    expect(f.posts).toContainEqual(expect.objectContaining({ type: "result", result: expect.objectContaining({ outcome: "not-supported" }) }));
+    f.core.handleUserBlock("/followup person F"); f.event("agent_end"); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "person F" }));
+    await f.core.acceptRunnerRequest(f.frame("managed F", 2, "input"));
+    expect(f.rpc.some(command => command.message === "managed F")).toBe(false);
+  });
+  it("rechecks exact E after correlated pre-abort state await before writing a global abort", async () => {
+    let reply!: () => void;
+    const f = managed(undefined, async () => ({ confirmed: true }), resume => { reply = resume; });
+    f.core.handleUserBlock("E"); f.event("agent_start");
+    await f.core.acceptRunnerRequest({ version: 1, runId: "run", requestId: "preflight", sequence: 1, kind: "cancel", payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } });
+    await new Promise(resolve => setImmediate(resolve)); expect(reply).toBeTypeOf("function");
+    f.event("agent_end"); f.event("agent_start");
+    // A cached positive state response must not authorize aborting the now-current F.
+    f.event("response", { id: "openrig-cancel-preflight-preflight", success: true, data: { isStreaming: true, pendingMessageCount: 0 } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc.filter(command => command.type === "abort")).toEqual([]);
+    expect(f.posts).toContainEqual(expect.objectContaining({ type: "result", result: expect.objectContaining({ outcome: "not-this-turn" }) }));
+  });
+  it("a correlated pre-abort state response with unknown queues terminates unsupported without native writes", async () => {
+    let reply!: () => void;
+    const f = managed(undefined, async () => ({ confirmed: true }), resume => { reply = resume; });
+    f.core.handleUserBlock("E"); f.event("agent_start");
+    await f.core.acceptRunnerRequest({ version: 1, runId: "run", requestId: "state-unknown", sequence: 1, kind: "cancel", payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } });
+    await new Promise(resolve => setImmediate(resolve)); expect(reply).toBeTypeOf("function");
+    f.event("queue_update", { steering: [], followUp: ["UNKNOWN FUTURE"] });
+    reply(); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc.filter(command => ["abort", "clear_queue"].includes(String(command.type)))).toEqual([]);
+    expect(f.posts).toContainEqual(expect.objectContaining({ type: "result", result: expect.objectContaining({ outcome: "not-supported", confirmed: false }) }));
+    f.core.handleUserBlock("/followup person F"); f.event("agent_end"); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "person F" }));
+  });
+  it("a late duplicate of refused A cannot clear B's post-write successor fence", async () => {
+    const f = managed(body => body.type === "ack" && body.requestId === "A" ? false : undefined, async () => ({ confirmed: true }));
+    f.core.handleUserBlock("E"); f.event("agent_start");
+    const a = { version: 1 as const, runId: "run", requestId: "A", sequence: 1, kind: "cancel" as const, payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } };
+    await f.core.acceptRunnerRequest(a); f.event("agent_end"); f.core.handleUserBlock("F"); f.event("agent_start");
+    await f.core.acceptRunnerRequest({ ...a, requestId: "B", sequence: 2, payload: { target: { runId: "run", nativeTurnId: "pi-invocation-2" } } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual({ type: "abort", id: "openrig-cancel-B" });
+    await f.core.acceptRunnerRequest(a); f.core.handleUserBlock("/followup person G"); f.event("agent_end");
+    await new Promise(resolve => setImmediate(resolve)); expect(f.rpc.some(command => command.message === "person G")).toBe(false);
+    f.event("response", { id: "openrig-cancel-B", success: true }); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "person G" }));
+  });
+  it("permanent cancel acknowledgement refusal releases only pre-effect preparation and leaves person input usable", async () => {
+    let withdrawals = 0;
+    const f = managed(body => body.type === "ack" ? false : undefined, async () => { withdrawals++; return { confirmed: true }; });
+    f.core.handleUserBlock("owned E"); f.event("agent_start");
+    await f.core.acceptRunnerRequest({ version: 1, runId: "run", requestId: "refused", sequence: 1, kind: "cancel", payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } });
+    f.core.handleUserBlock("/followup person F"); f.event("agent_end"); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "person F" }));
+    expect(f.rpc.filter(command => ["abort", "clear_queue"].includes(String(command.type)))).toEqual([]);
+    expect(withdrawals).toBe(0);
+  });
   it.each([true, false])("only clears positively E-owned residual steers before releasing successors (owned=%s)", async owned => {
     const f = managed(undefined, async () => ({ confirmed: true })); f.core.handleUserBlock("start"); f.event("agent_start");
     if (owned) f.core.handleUserBlock("owned steer");
-    f.event("queue_update", { steering: [owned ? "owned steer" : "unknown extension"], followUp: [] });
+    if (owned) f.event("queue_update", { steering: ["owned steer"], followUp: [] });
     await f.core.acceptRunnerRequest({ version: 1, runId: "run", requestId: "residual", sequence: 1, kind: "cancel", payload: { target: { runId: "run", nativeTurnId: "pi-invocation-1" } } });
-    await new Promise(resolve => setImmediate(resolve)); f.core.handleUserBlock("/followup future");
+    await new Promise(resolve => setImmediate(resolve));
+    if (!owned) f.event("queue_update", { steering: ["unknown extension"], followUp: [] });
+    f.core.handleUserBlock("/followup future");
     f.event("message_end", { message: { role: "assistant", stopReason: "aborted" } }); f.event("agent_end");
     f.event("response", { id: "openrig-cancel-residual", success: true }); await new Promise(resolve => setImmediate(resolve));
     expect(f.rpc.some(command => command.type === "clear_queue")).toBe(owned);

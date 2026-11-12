@@ -156,11 +156,15 @@ export class AgentPeer {
     if (!this.#prompt?.submitted || this.#prompt.nativeTurnId !== nativeTurnId) return false;
     this.#cancellationFence = nativeTurnId; return true;
   }
-  // Preparation recheck releases only a target that ended before any managed cancel submission.
+  // Release only once this exact prompt is no longer outstanding.
   recheckCancellation(nativeTurnId) {
     if (this.#cancellationFence !== nativeTurnId) return false;
     if (this.#prompt?.nativeTurnId === nativeTurnId) return true;
     this.#cancellationFence = null; return false;
+  }
+
+  abandonCancellationPreparation(nativeTurnId) {
+    if (this.#cancellationFence === nativeTurnId) this.#cancellationFence = null;
   }
 
   notify(method, params) { this.#write({ method, params }); }
@@ -351,6 +355,7 @@ async function main() {
     while (cancellation === operation && !agentExited) {
       const response = await callOpenRig("POST", "/api/activity/runner-channel", { type: "cancel-prepare", runId: f.runId,
         requestId: f.requestId, sequence: f.sequence }, POST_TIMEOUT_MS);
+      if (cancellation !== operation) return;
       if (peer.promptScope()?.nativeTurnId !== operation.target.nativeTurnId || response.body?.withdrawal?.notThisTurn) { finishCancel("not-this-turn"); return; }
       if (response.status === 200 && response.body?.withdrawal?.confirmed === true) break;
       await sleep(250);
@@ -380,13 +385,21 @@ async function main() {
     managed.set(frame.requestId, entry);
     const target = frame.kind === "cancel" ? frame.payload.target : null;
     const prepared = target && !cancellation && peer.prepareCancellation(target.nativeTurnId);
-    if (prepared) cancellation = { entry, target, submitted: false };
+    const operation = prepared ? { entry, target, submitted: false } : null;
+    if (operation) cancellation = operation;
     entry.acceptance = (async () => {
-      if (!await channelPost({ type: "ack", runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, state: "accepted" })) { entry.state = "unavailable"; return; }
+      if (!await channelPost({ type: "ack", runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, state: "accepted" })) {
+        entry.state = "unavailable";
+        if (operation && cancellation === operation && !operation.submitted) {
+          peer.abandonCancellationPreparation(operation.target.nativeTurnId); cancellation = null; pump();
+        }
+        return;
+      }
+      if (operation && cancellation !== operation) return;
       entry.state = "queued";
       if (target) {
         if (!prepared) { entry.state = "terminal"; report(entry, "result", { kind: "cancel", outcome: peer.promptScope()?.nativeTurnId === target.nativeTurnId ? "not-supported" : "not-this-turn", confirmed: false }); }
-        else void performCancel(cancellation).catch(() => {});
+        else void performCancel(operation).catch(() => {});
         return;
       }
       const before = state.queue.findIndex(other => typeof other !== "string" && other.frame.sequence > frame.sequence);
