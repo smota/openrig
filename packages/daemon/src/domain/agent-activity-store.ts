@@ -222,7 +222,7 @@ export class AgentActivityStore {
         // Known Core references are never replaced or re-verified by a runner claim, including matching repeats.
         if (!row.resume_token) {
           const runtime = grant.binding!.runtime;
-          const resumeType = runtime === "pi" ? "pi_session_file" : `community:${runtime}`;
+          const resumeType = runtime === "pi" || runtime === "omp" ? `${runtime}_session_file` : `community:${runtime}`;
           new SessionRegistry(this.db).recordLauncherReportedToken(session.sessionId, resumeType, observations.session.nativeRef, "hook");
           register(this.eventBus.persistWithinTransaction({ type: "agent.session_identity", rigId: session.rigId,
             nodeId: grant.nodeId, sessionName: row.session_name, runtime, sessionId: observations.session.nativeRef, provenance: "hook" }));
@@ -641,8 +641,8 @@ function normalizeRunnerObservations(raw: unknown, grant: ActivityGrant): Runner
   if (raw.session !== undefined) {
     if (!object(raw.session) || !only(raw.session, ["nativeRef"])) return null;
     const ref = raw.session.nativeRef;
-    if (grant.binding?.runtime === "pi" || grant.binding?.runner === AGENT_RUNNER_HOSTED_PI_RPC) {
-      const valid = validateSessionFileFormat(ref);
+    if (grant.binding?.runtime === "pi" || grant.binding?.runtime === "omp" || grant.binding?.runner === AGENT_RUNNER_HOSTED_PI_RPC) {
+      const valid = validateSessionFileFormat(ref, grant.binding.runtime);
       if (!valid.ok) return null;
       out.session = { nativeRef: valid.token };
     } else {
