@@ -4,6 +4,10 @@
 // event→activity mapping, the get_state identity capture + sidecar, the
 // durable catch-up cursor, and honest pi-exit reporting. No live pi.
 
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import readline from "node:readline";
@@ -1396,14 +1400,14 @@ describe("managed run identity retries", () => {
 
 
 describe("managed Pi input and attributed wake", () => {
-  function managed() {
+  function managed(retain?: (body: Record<string, unknown>) => void) {
     const f = fakeIo(), posts: Record<string, unknown>[] = [];
     let nativeBusy = false;
     const core = new RunnerCore({ ...f.io, sendRpc: command => {
       f.rpc.push(command);
       if (command.type === "get_state" && String(command.id).startsWith("openrig-native-idle-"))
         queueMicrotask(() => core.handlePiLine(JSON.stringify({ type: "response", id: command.id, success: true, data: { isStreaming: nativeBusy, pendingMessageCount: 0 } })));
-    }, postActivity: async body => { f.activity.push(body); return { tokenPersisted: true }; }, postRunner: async (body: Record<string, unknown>) => { posts.push(body); return true; } },
+    }, postActivity: async body => { f.activity.push(body); return { tokenPersisted: true }; }, postRunner: async (body: Record<string, unknown>) => { posts.push(body); retain?.(body); return true; } },
       { sessionName: SESSION, runId: "run" });
     core.start(); core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", success: true, data: { sessionId: "native", isStreaming: false, pendingMessageCount: 0 } }));
     const frame = (id: string, sequence: number, kind: "input" | "wake") => ({ version: 1, requestId: id, runId: "run", sequence, kind,
@@ -1415,6 +1419,76 @@ describe("managed Pi input and attributed wake", () => {
     const response = (id: string, success = true) => event("response", { id: `openrig-native-${id}`, command: "prompt", success, data: { disposition: "started" } });
     return { ...f, posts, core, frame, event, response };
   }
+  function retainedInput() {
+    const db = createDb(); migrate(db, [outboxEntriesSchema]); db.exec("ALTER TABLE outbox_entries ADD COLUMN guard_delivery TEXT");
+    const outbox = new OutboxHandler(db);
+    const f = managed(body => {
+      if (!body.requestId) return;
+      outbox.updateRunner("node", "run", String(body.requestId), Number(body.sequence),
+        body.type === "ack" ? "accepted" : body.type === "result" ? "completed" : body.type as "submitted" | "rejected",
+        { ...(body.nativeTurnId ? { nativeTurnId: String(body.nativeTurnId) } : {}),
+          ...(body.acceptedTurnId ? { acceptedTurnId: String(body.acceptedTurnId) } : {}),
+          ...(body.result ? { result: body.result as Record<string, unknown> } : {}) });
+    });
+    const frame = (id: string) => {
+      const receipt = outbox.admitRunner({ outboxId: id, nodeId: "node", runId: "run", kind: "input", inputRoute: "native",
+        payload: { text: id }, senderSession: "person", destinationSession: SESSION, body: id });
+      outbox.updateRunner("node", "run", id, receipt.sequence, "offered");
+      return f.frame(id, receipt.sequence, "input");
+    };
+    return { ...f, db, outbox, frame };
+  }
+  it("retains the actual invocation mapping when prompt acceptance precedes agent_start", async () => {
+    const f = retainedInput();
+    try {
+      const first = f.frame("first");
+      await f.core.acceptRunnerRequest({ ...first, runId: "other-run" });
+      expect(f.rpc.filter(command => command.message === "first")).toEqual([]);
+      expect(f.outbox.runnerReceipt("first")).toMatchObject({ stage: "offered" });
+      await f.core.acceptRunnerRequest(first); f.response("first");
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("first")).toMatchObject({ stage: "submitted" });
+      expect(f.posts.filter(post => post.type === "result")).toEqual([]);
+      f.event("agent_start"); await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("first")).toMatchObject({ stage: "completed", nativeTurnId: "pi-invocation-1", acceptedTurnId: "1", result: { kind: "input", accepted: true } });
+      // Both busy steers keep their own accepted ordinal while sharing that execution epoch.
+      for (const id of ["second", "third"]) { await f.core.acceptRunnerRequest(f.frame(id)); f.response(id); }
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("second")).toMatchObject({ nativeTurnId: "pi-invocation-1", acceptedTurnId: "2" });
+      expect(f.outbox.runnerReceipt("third")).toMatchObject({ nativeTurnId: "pi-invocation-1", acceptedTurnId: "3" });
+    } finally { f.db.close(); }
+  });
+  it.each(["handled", "agentInvokedFalse"])("local-only %s completes without inheriting a later unrelated invocation", async mode => {
+    const f = retainedInput();
+    try {
+      await f.core.acceptRunnerRequest(f.frame("local"));
+      f.event("response", { id: "openrig-native-local", success: true, data: mode === "handled" ? { disposition: "handled" } : { agentInvoked: false } });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("local")).toMatchObject({ stage: "completed", result: { accepted: true } });
+      expect(f.outbox.runnerReceipt("local")?.nativeTurnId).toBeUndefined();
+      await f.core.acceptRunnerRequest(f.frame("next"));
+      expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "next" }));
+      f.response("next"); f.event("agent_start"); await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("next")).toMatchObject({ nativeTurnId: "pi-invocation-1" });
+      expect(f.posts.filter(post => post.requestId === "local").some(post => post.nativeTurnId !== undefined)).toBe(false);
+    } finally { f.db.close(); }
+  });
+  it("maps normally when agent_start precedes the prompt response and never completes a start that never arrives", async () => {
+    const f = retainedInput();
+    try {
+      await f.core.acceptRunnerRequest(f.frame("first")); f.event("agent_start"); f.response("first");
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("first")).toMatchObject({ stage: "completed", nativeTurnId: "pi-invocation-1", acceptedTurnId: "1" });
+      f.event("agent_end"); await new Promise(resolve => setImmediate(resolve));
+      await f.core.acceptRunnerRequest(f.frame("never opens")); f.response("never opens");
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("never opens")).toMatchObject({ stage: "submitted" });
+      f.core.handlePiExit(1); await new Promise(resolve => setImmediate(resolve));
+      expect(f.outbox.runnerReceipt("never opens")).toMatchObject({ stage: "submitted" });
+      expect(f.outbox.runnerReceipt("never opens")?.nativeTurnId).toBeUndefined();
+      expect(f.rpc.filter(p => p.message === "never opens")).toHaveLength(1);
+    } finally { f.db.close(); }
+  });
   it("reports one native invocation for two steers and inner model turns", async () => {
     const f = managed(); f.core.handleUserBlock("start"); f.event("agent_start");
     f.core.handleUserBlock("steer one"); f.event("turn_start"); f.core.handleUserBlock("steer two");

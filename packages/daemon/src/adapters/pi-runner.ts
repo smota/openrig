@@ -1137,15 +1137,30 @@ export class RunnerCore {
       this.managedRpc.delete(String(record.id));
       if (record.success === true) {
         managed.nativeAccepted = true; managed.state = "submitted"; this.reportManaged(managed, "submitted");
+        const inputData = record.data as { disposition?: unknown; agentInvoked?: boolean } | undefined;
         if (managed.frame.kind === "wake") {
-          const disposition = (record.data as { disposition?: unknown } | undefined)?.disposition;
+          const disposition = inputData?.disposition;
           managed.disposition = typeof disposition === "string" ? disposition : "unknown";
           if (!["started", "handled"].includes(managed.disposition) || managed.preDispositionEvents) this.managedQuarantined = true;
           if (managed.nativeTerminal || managed.disposition !== "started" && !this.streaming) this.finishManagedWake(managed);
           else if (managed.terminalResult) this.reportManaged(managed, "result", managed.terminalResult);
           if (this.managedWake !== managed && !this.streaming) { this.pendingManagedStart = false; this.pumpManaged(); }
-        } else { managed.state = "terminal"; this.reportManaged(managed, "result", { kind: "input", accepted: true }); }
+        } else {
+          managed.disposition = inputData?.agentInvoked === false ? "handled" : typeof inputData?.disposition === "string" ? inputData.disposition : "unknown";
+          if (managed.disposition === "handled") {
+            this.pendingNativeInputs.delete(managed);
+            delete managed.nativeTurnId; delete managed.acceptedTurnId;
+            if (!this.streaming) this.pendingManagedStart = false;
+          }
+          // A started prompt's acknowledgement precedes agent_start. Wait for that actual scope before
+          // committing its immutable terminal receipt; a handled local command has no native epoch.
+          if (managed.disposition !== "started" || managed.nativeTurnId) {
+            managed.state = "terminal"; this.reportManaged(managed, "result", { kind: "input", accepted: true });
+          }
+          if (managed.disposition === "handled") { this.pumpPersonPrompts(); this.pumpManaged(); }
+        }
       } else {
+        this.pendingNativeInputs.delete(managed);
         managed.state = "terminal"; this.pendingManagedStart = false;
         this.reportManaged(managed, "rejected", { kind: managed.frame.kind, reason: "native_prompt_rejected" });
         if (this.managedWake === managed) this.managedWake = null;
@@ -1459,7 +1474,9 @@ export class RunnerCore {
       this.reportNativeTurn("opened");
       for (const entry of this.pendingNativeInputs) {
         entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn);
-        if (entry.terminalResult) this.reportManaged(entry, "result", entry.terminalResult);
+        if (entry.frame.kind === "input" && entry.nativeAccepted && entry.disposition === "started") {
+          entry.state = "terminal"; this.reportManaged(entry, "result", { kind: "input", accepted: true });
+        }
       }
       this.pendingNativeInputs.clear();
       this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
