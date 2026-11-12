@@ -988,6 +988,14 @@ async function submitPermission(c: Context, installTokenAccepted: boolean): Prom
   }
   const parsed = parseRunnerPermissionRequest(body);
   if (!parsed.ok) return c.json({ ok: false, code: "invalid_permission_request", error: parsed.message }, 400);
+  if (parsed.request.runId) {
+    const current = (c.get("runnerChannel" as never) as RunnerChannel | undefined)?.currentTurn(seat.nodeId);
+    if (!ctx.grant?.runId || ctx.grant.runId !== parsed.request.runId
+      || new ActivityGrantStore(ctx.store.db).standing(ctx.grant.grantId) !== "current"
+      || current?.runId !== parsed.request.runId || current.nativeTurnId !== parsed.request.nativeTurnId
+      || !current.acceptedTurnIds.includes(parsed.request.turnId))
+      return c.json({ ok: false, code: "runner_turn_unbound", error: "Permission metadata needs current bound native turn evidence." }, 409);
+  }
   const result = await ctx.permissions.submit(seat, parsed.request);
   if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, PERMISSION_REFUSAL_STATUS[result.code] ?? 409);
   // No one to ask: permitted at once with the agent's own allow. Nothing waits on a person, so nothing reads needs input.
