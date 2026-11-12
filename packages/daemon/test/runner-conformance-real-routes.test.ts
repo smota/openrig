@@ -2,7 +2,7 @@
 // routes, served over HTTP, instead of the check's stand-in: so the wire the check accepts is the wire OpenRig speaks.
 // A person's click reaches the agent, OpenRig's permit is delivered, the seat's opt-in refusal is held, and an earlier
 // occupant's request is cancelled, never asked. No model, tmux or Slack is involved.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -242,9 +242,13 @@ describe("run-bound native channel custody", () => {
     if (!retained) expect(grants.activate(grant.grantId)).toBe(true);
     const { OutboxHandler } = await import("../src/domain/outbox-handler.js");
     const bus = new EventBus(db);
-    const queueRepo = new QueueRepository(db, bus, { validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
+    const people = { ok: true as const, entities: [] as ReturnType<typeof person>[] };
+    const queueRepo = new QueueRepository(db, bus, { validateRig: () => true, loadHumanRegistry: () => people,
+      permissionDecider: () => null, transport: { send: async () => ({ ok: true, verified: true, sent: true }) } });
     const activityStore = new AgentActivityStore({ db, eventBus: bus });
     const outbox = new OutboxHandler(db), channel = new RunnerChannel(grants, outbox, enabled ? new Set([runner === 0 ? "managed-pi" : runner === 1 ? "preset" : "hosted-pi-rpc"]) : new Set());
+    queueRepo.attachOutbox(outbox);
+    const contract = new MissionControlWriteContract({ db, eventBus: bus, queueRepo, actionLog: new MissionControlActionLog(db) });
     const { SeatDeliveryGuard, resolveGuardTarget } = await import("../src/domain/seat-delivery-guard.js");
     const { SessionTransport } = await import("../src/domain/session-transport.js");
     const { seatRoutes } = await import("../src/routes/seat.js");
@@ -255,13 +259,15 @@ describe("run-bound native channel custody", () => {
     app.use("*", async (c, next) => {
       c.set("runnerChannel" as never, channel); c.set("rigRepo" as never, rigs);
       c.set("eventBus" as never, bus); c.set("queueRepo" as never, queueRepo); c.set("agentActivityStore" as never, activityStore); c.set("sessionRegistry" as never, registry);
+      c.set("activityHookToken" as never, INSTALL); c.set("missionControlWriteContract" as never, contract);
       c.set("tmuxAdapter" as never, tmux); c.set("sessionTransport" as never, transport); await next();
     });
     app.route("/api/activity", activityRoutes); app.route("/api/seat", seatRoutes);
+    app.route("/api/mission-control", missionControlRoutes());
     const hello = { type: "hello", version: 1, runId: "run-one", retained: true, capabilities: { input: true, wake: true, cancel: true } };
     const admit = (id: string) => channel.admit(grant.nodeId, { outboxId: id, senderSession: "sender", destinationSession: "dev@channel", body: id,
       kind: "input", inputRoute: "native", payload: { text: id } });
-    return { db, node, grant, grants, outbox, channel, hello, admit, app, guard, transport };
+    return { db, node, grant, grants, outbox, channel, hello, admit, app, guard, transport, queueRepo, people };
   }
   it("retains authenticated native epoch evidence with family-local sequence and replay conflict checks", async () => {
     const f = await fixture(); f.channel.post(f.grant.token, f.hello);
@@ -294,6 +300,20 @@ describe("run-bound native channel custody", () => {
     expect(f.outbox.runnerReceipt("cancel-E")?.withdrawal?.stage).toBe("confirmed");
     expect(f.outbox.runnerReceipt(ordinary.requestId)?.stage).toBe("pending");
     expect((await f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, target: { ...request.target, nativeTurnId: "F" } }) })).status).toBe(409);
+  });
+  it("keeps retained E and permission binding during SSE disconnect without pretending unknown is idle", async () => {
+    const f = await fixture(); f.channel.post(f.grant.token, f.hello);
+    const disconnect = f.channel.connect(f.grant.token);
+    f.channel.post(f.grant.token, { type: "turn", runId: "run-one", sequence: 1, nativeTurnId: "E", state: "opened", acceptedTurnIds: ["1"] });
+    disconnect();
+    expect(f.channel.capable(f.node.id, "cancel")).toBe(false);
+    expect(f.channel.currentTurn(f.node.id)).toMatchObject({ runId: "run-one", nativeTurnId: "E" });
+    const response = await f.app.request("/api/activity/permission-requests", { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${f.grant.token}` },
+      body: JSON.stringify({ nodeId: f.node.id, sessionName: "dev@channel", generation: f.grant.generation,
+        runId: "run-one", nativeTurnId: "E", nativeRef: "native", turnId: "1", requestId: "still-live",
+        toolCall: { title: "edit" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }) });
+    expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ state: "permitted", optionId: "allow" });
   });
   it("pending withdrawal has no fifth outcome, late E preserves its withdrawal evidence and wrong-run preparation has no effects", async () => {
     const f = await fixture(); f.channel.post(f.grant.token, f.hello); cleanups.push(f.channel.connect(f.grant.token));
@@ -349,34 +369,51 @@ describe("run-bound native channel custody", () => {
   async function nativeProcess(kind: "pi" | "dsh", program?: { bin: string; providerUrl: string }) {
     const dir = mkdtempSync(join(tmpdir(), `native-recovery-${kind}-`)), file = join(dir, "core.sqlite"), log = join(dir, "native.log");
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const { mkdirSync, unlinkSync, symlinkSync } = await import("node:fs"); const bin = join(dir, "bin"); mkdirSync(bin);
+    const { mkdirSync } = await import("node:fs"); const bin = join(dir, "bin"); mkdirSync(bin);
     const backend = join(bin, kind);
-    const common = `#!${process.execPath}\nconst fs=require('node:fs');const send=x=>console.log(JSON.stringify(x));const log=x=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(x)+'\\n');log({childToken:!!process.env.OPENRIG_ACTIVITY_HOOK_TOKEN});`;
+    const common = `#!${process.execPath}\nconst fs=require('node:fs');const send=x=>{log({native:x});console.log(JSON.stringify(x));};const log=x=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(x)+'\\n');log({childToken:!!process.env.OPENRIG_ACTIVITY_HOOK_TOKEN});process.stdin.on('end',()=>process.exit(0));`;
     // Distinct offline RPC and ACP backends. Each is exercised through its own production consumer.
     writeFileSync(backend, kind === "pi" ? `${common}
-let busy=false,timer;const end=(stopReason,message)=>{send({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'answer '+message}],stopReason}});busy=false;send({type:'agent_end'});};require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const c=JSON.parse(line);log(c);
+let busy=false,timer,activeText='';const end=(stopReason,message)=>{send({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'answer '+message}],stopReason}});busy=false;send({type:'agent_end'});};require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const c=JSON.parse(line);log(c);
 if(c.type==='get_state')return send({type:'response',id:c.id,success:true,data:{isStreaming:busy,pendingMessageCount:0,sessionId:'fixture'}});
-if(c.type==='get_entries')return send({type:'response',id:c.id,success:true,data:{entries:[]}});if(c.type==='abort'){if(busy){clearTimeout(timer);end('aborted','cancelled');}return send({type:'response',id:c.id,success:true});}if(c.type!=='prompt')return;
+if(c.type==='get_entries')return send({type:'response',id:c.id,success:true,data:{entries:[]}});if(c.type==='abort'){if(activeText.includes('EXIT CANCEL'))return process.exit(7);if(busy&&!activeText.includes('IGNORE CANCEL')){clearTimeout(timer);end('aborted','cancelled');}return send({type:'response',id:c.id,success:true});}if(c.type!=='prompt')return;
 if(c.message==='REFUSE')return send({type:'response',id:c.id,success:false,error:'fixture refusal'});
 send({type:'response',id:c.id,command:'prompt',success:true,data:{disposition:busy?'queued':'started'}});if(busy)return;
-busy=true;send({type:'agent_start'});timer=setTimeout(()=>end(c.message==='INTERRUPT'?'aborted':'stop',c.message),c.message.startsWith('HOLD')?5000:c.message.startsWith('SLOW')?900:80);
+busy=true;activeText=c.message;send({type:'agent_start'});timer=setTimeout(()=>end(c.message==='INTERRUPT'?'aborted':'stop',c.message),c.message.startsWith('HOLD')?5000:c.message.startsWith('SLOW')?900:80);
 });` : `${common}
-if(process.argv.includes('--version')){console.log('fixture dsh');process.exit(0);}const session='native-fixture';let active,timer;
+if(process.argv.includes('--version')){console.log('fixture dsh');process.exit(0);}const session='native-fixture';let active,timer,activeText='';
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const c=JSON.parse(line);log(c);const reply=result=>send({jsonrpc:'2.0',id:c.id,result});
 if(c.method==='initialize')return reply({protocolVersion:1,agentCapabilities:{},agentInfo:{name:'dsh',version:'fixture'}});
-if(c.method==='session/new')return reply({sessionId:session});if(c.method==='session/cancel'){if(active){clearTimeout(timer);active({stopReason:'cancelled'});active=null;}return;}if(c.method!=='session/prompt')return;
-const text=c.params.prompt.map(p=>p.text||'').join('');if(text==='REFUSE')return send({jsonrpc:'2.0',id:c.id,error:{code:-32602,message:'fixture refusal'}});
+if(c.method==='session/new')return reply({sessionId:session});if(c.method==='session/cancel'){if(activeText.includes('EXIT CANCEL'))return process.exit(7);if(activeText.includes('IGNORE CANCEL'))return;if(active){clearTimeout(timer);active({stopReason:'cancelled'});active=null;}return;}if(c.method!=='session/prompt')return;
+const text=c.params.prompt.map(p=>p.text||'').join('');activeText=text;if(text==='REFUSE')return send({jsonrpc:'2.0',id:c.id,error:{code:-32602,message:'fixture refusal'}});
+if(text.includes('PERMISSION E'))for(const id of [1001,1002])send({jsonrpc:'2.0',id,method:'session/request_permission',params:{sessionId:session,toolCall:{title:'edit '+id,kind:'edit'},options:[{optionId:'allow',name:'Allow once',kind:'allow_once'},{optionId:'reject',name:'Reject',kind:'reject_once'}]}});
 send({jsonrpc:'2.0',method:'session/update',params:{sessionId:session,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'answer '+text}}}});
-active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'});},text.startsWith('HOLD')?5000:text.startsWith('SLOW')?900:80);
+active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'});},text.includes('PERMISSION E')?20000:text.startsWith('HOLD')?5000:text.startsWith('SLOW')?900:80);
 });`, { mode: 0o755 });
+    if (program) {
+      // A transparent scratch wire tap counts real RPC/ACP effects; it never substitutes native replies.
+      writeFileSync(backend, `#!${process.execPath}
+const fs=require('node:fs'),rl=require('node:readline'),spawn=require('node:child_process').spawn;
+const log=x=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(x)+'\\n');log({childToken:!!process.env.OPENRIG_ACTIVITY_HOOK_TOKEN});
+const child=spawn(${JSON.stringify(program.bin)},process.argv.slice(2),{env:process.env,stdio:['pipe','pipe','inherit']});
+child.stdin.on('error',()=>{});
+rl.createInterface({input:process.stdin}).on('line',line=>{try{log(JSON.parse(line));}catch{}child.stdin.write(line+'\\n');}).on('close',()=>{child.stdin.end();setTimeout(()=>child.kill('SIGKILL'),1000).unref();});
+rl.createInterface({input:child.stdout}).on('line',line=>{try{const x=JSON.parse(line);const data=x.data,result=x.result;
+log({native:{type:x.type,id:x.id,method:x.method,success:x.success,steering:x.steering,followUp:x.followUp,
+message:x.message?{role:x.message.role,stopReason:x.message.stopReason}:undefined,
+data:data?{isStreaming:data.isStreaming,pendingMessageCount:data.pendingMessageCount,disposition:data.disposition,steering:data.steering,followUp:data.followUp}:undefined,
+result:result?{stopReason:result.stopReason,sessionId:result.sessionId,outcome:result.outcome}:undefined}});}catch{}process.stdout.write(line+'\\n');});
+process.on('SIGTERM',()=>child.kill('SIGTERM'));child.on('error',()=>{process.exitCode=1;});child.on('exit',code=>{process.exitCode=code??1;});
+`, { mode: 0o755 });
+    }
     if (program && kind === "pi") {
-      unlinkSync(backend); symlinkSync(program.bin, backend);
       const agent = join(dir, "state", "dev@channel", "agent"); mkdirSync(agent, { recursive: true });
       writeFileSync(join(agent, "models.json"), JSON.stringify({ providers: { local: { baseUrl: program.providerUrl, api: "anthropic-messages", apiKey: "offline-dummy", models: [{ id: "fixture-model", name: "Offline fixture", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
     }
     let current = await fixture(true, kind, kind === "pi" ? 0 : 1, file);
     let fault: { type: string; commit: boolean; hits: number; requestId?: string; status?: number } | null = null;
     let lookupDelay = 0;
+    let permissionReadGate: Promise<void> | null = null, heldPermissionReads = 0;
     let hellos = 0;
     const server = serve({ hostname: "127.0.0.1", port: 0, fetch: async request => {
       const body = request.method === "POST" && new URL(request.url).pathname === "/api/activity/runner-channel" ? await request.clone().json() as { type: string; requestId?: string } : null;
@@ -385,6 +422,10 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
       if (active) active.hits += 1;
       if (active && !active.commit) return new Response(null, { status: active.status ?? 503 });
       const response = await current.app.fetch(request);
+      if (permissionReadGate && request.method === "GET" && new URL(request.url).pathname.startsWith("/api/activity/permission-requests/")) {
+        const answer = await response.clone().json() as { state?: string; optionId?: string };
+        if (answer.state === "answered" && answer.optionId) { heldPermissionReads++; await permissionReadGate; }
+      }
       if (lookupDelay && request.method === "GET" && new URL(request.url).pathname.startsWith("/api/seat/command/")) await sleep(lookupDelay);
       return active ? new Response(null, { status: active.status ?? 503 }) : response;
     } });
@@ -397,7 +438,7 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
       const f = current;
       const child = spawn(process.execPath, kind === "pi" ? ["--import", resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs"), resolve(__dirname, "../src/adapters/pi-runner.ts"), "--session-name", "dev@channel", "--state-root", join(dir, "state"), "--cwd", dir, "--launch-id", f.grant.runId!, "--no-approve", ...(program ? ["--model", "local/fixture-model"] : [])]
         : [resolve(__dirname, "../../../docs/reference/community-harness-examples/dsh/openrig-dsh-runner.mjs")],
-      { cwd: dir, stdio: ["pipe", "pipe", "pipe"], env: { PATH: `${bin}:${process.env.PATH}`, HOME: dir, XDG_CONFIG_HOME: join(dir, "config"), XDG_DATA_HOME: join(dir, "data"), XDG_CACHE_HOME: join(dir, "cache"), DSH_HOME: join(dir, "dsh"), DSH_SEAT_BIN: program?.bin ?? backend, DSH_TELEMETRY_DISABLED: "1", ...(program ? { DEEPSEEK_API_KEY: "offline-dummy", DEEPSEEK_BASE_URL: program.providerUrl } : {}),
+      { cwd: dir, stdio: ["pipe", "pipe", "pipe"], env: { PATH: `${bin}:${process.env.PATH}`, HOME: dir, XDG_CONFIG_HOME: join(dir, "config"), XDG_DATA_HOME: join(dir, "data"), XDG_CACHE_HOME: join(dir, "cache"), DSH_HOME: join(dir, "dsh"), DSH_SEAT_BIN: backend, DSH_TELEMETRY_DISABLED: "1", ...(program ? { DEEPSEEK_API_KEY: "offline-dummy", DEEPSEEK_BASE_URL: program.providerUrl } : {}),
         OPENRIG_HOME: join(dir, "home"), OPENRIG_URL: url, OPENRIG_ACTIVITY_HOOK_TOKEN: f.grant.token, OPENRIG_RUN_ID: f.grant.runId!,
         OPENRIG_NODE_ID: f.node.id, OPENRIG_SESSION_NAME: "dev@channel", OPENRIG_OCCUPANT_GENERATION: f.grant.generation, OPENRIG_RUNTIME: kind } });
       child.stdout!.on("data", chunk => { output += String(chunk); }); child.stderr!.on("data", chunk => { output += String(chunk); }); children.push(child); return child;
@@ -413,8 +454,81 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
     const prompts = () => entries().filter(entry => kind === "pi" ? entry.type === "prompt" : entry.method === "session/prompt")
       .map(entry => kind === "pi" ? entry.message : ((entry.params as { prompt: Array<{ text: string }> }).prompt.map(p => p.text).join("")));
     return { start, ready, reopen, url, server, prompts, entries, dir, get output() { return output; }, get f() { return current; }, get hellos() { return hellos; },
+      set permissionReadGate(value: Promise<void> | null) { permissionReadGate = value; }, get heldPermissionReads() { return heldPermissionReads; },
       get fault() { return fault; }, set fault(value) { fault = value; }, set lookupDelay(value: number) { lookupDelay = value; } };
   }
+
+  it.each(["pending", "delivered", "in-flight answer", "handed-off answer", "in-flight submission"] as const)("dsh named cancellation fences %s through actual human and receiving-agent write owners", async mode => {
+    const h = await nativeProcess("dsh"); h.f.people.entities.push(person("mike"), person("dana"));
+    h.f.db.prepare("UPDATE nodes SET permissions_to=? WHERE id=?").run(PERSON, h.f.node.id);
+    const asks = () => h.f.queueRepo.list({ limit: 100 }).filter(row => row.tags?.includes("runner-permission") && !row.handedOffFrom);
+    const act = async (id: string, verb: string, actor = PERSON, extra: Record<string, unknown> = {}) => h.f.app.request("/api/mission-control/action", {
+      method: "POST", headers: { "content-type": "application/json", "X-OpenRig-Session": actor },
+      body: JSON.stringify({ verb, qitemId: id, actorSession: actor, ...extra }) });
+    const decide = async (id: string) => h.f.app.request(`/api/activity/permission-requests/${id}/decide`, { method: "POST",
+      headers: { "content-type": "application/json", "X-OpenRig-Session": "lead@channel" }, body: JSON.stringify({ optionId: "allow", reason: "the person agreed" }) });
+    const permissionReplies = () => h.entries().filter(entry => [1001, 1002].includes(entry.id as number) && !entry.method && entry.result);
+    let releaseRead!: () => void, releaseCreate!: () => void;
+    if (mode === "in-flight answer" || mode === "handed-off answer") {
+      h.permissionReadGate = new Promise<void>(done => { releaseRead = done; }); cleanups.push(() => releaseRead());
+    }
+    if (mode === "in-flight submission") {
+      const create = h.f.queueRepo.create.bind(h.f.queueRepo);
+      const spy = vi.spyOn(h.f.queueRepo, "create").mockImplementationOnce(async input => {
+        await new Promise<void>(done => { releaseCreate = done; }); return create(input);
+      });
+      cleanups.push(() => { releaseCreate?.(); spy.mockRestore(); });
+    }
+    h.start(); await h.ready();
+    await h.f.transport.sendNativeWake("dev@channel", "HOLD PERMISSION E", "permission-E", "sender");
+    expect(await waitFor(() => asks().length === (mode === "in-flight submission" ? 1 : 2)), h.output).toBe(true);
+    const target = h.f.channel.currentTurn(h.f.node.id)!; expect(target).toBeTruthy();
+    const first = asks()[0]!;
+    if (["delivered", "in-flight answer", "handed-off answer"].includes(mode)) {
+      let answerId = first.qitemId, actor = PERSON;
+      if (mode === "handed-off answer") {
+        expect((await act(answerId, "handoff", PERSON, { destinationSession: "dana@external" })).status).toBe(200);
+        const child = h.f.queueRepo.list({ limit: 100 }).find(row => row.handedOffFrom === answerId)!;
+        expect(child).toBeTruthy(); answerId = child.qitemId; actor = "dana@external";
+      }
+      expect((await act(answerId, "answer", actor, { questionId: "permission", optionId: "allow" })).status).toBe(200);
+      expect((await decide(first.qitemId)).status).toBe(200);
+      if (mode === "delivered") expect(await waitFor(() => permissionReplies().length === 1), h.output).toBe(true);
+      else expect(await waitFor(() => h.heldPermissionReads === 1), h.output).toBe(true);
+    }
+    await h.f.transport.sendNativeWake("dev@channel", "SLOW SAFE F", "permission-F", "sender");
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "cancel", requestId: "cancel-permissions", target: { runId: target.runId, nativeTurnId: target.nativeTurnId } }) })).status).toBe(202);
+    if (mode === "in-flight submission") {
+      expect(await waitFor(() => h.f.outbox.runnerReceipt("cancel-permissions")?.withdrawal?.stage === "pending"), h.output).toBe(true);
+      expect(h.entries().filter(entry => entry.method === "session/cancel")).toEqual([]);
+      releaseCreate();
+    }
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("cancel-permissions")?.result?.outcome === "cancelled"), h.output).toBe(true);
+    expect(h.f.outbox.runnerReceipt("cancel-permissions")?.withdrawal?.stage).toBe("confirmed");
+    releaseRead?.();
+    // These are the same write owners as Steering and `seat decide-permission`, after E has been withdrawn.
+    for (const ask of asks()) {
+      await act(ask.qitemId, "answer", PERSON, { questionId: "permission", optionId: "allow" });
+      const late = await decide(ask.qitemId);
+      expect(await late.json()).toMatchObject({ state: "withdrawn" });
+    }
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("permission-F")?.result?.completion === "completed"), h.output).toBe(true);
+    const replies = permissionReplies(); expect(replies).toHaveLength(2);
+    const selected = replies.filter(entry => (entry.result as { outcome: { outcome: string } }).outcome.outcome === "selected");
+    expect(selected).toHaveLength(mode === "delivered" ? 1 : 0);
+    const records = h.entries(), cancelIndex = records.findIndex(entry => entry.method === "session/cancel");
+    expect(cancelIndex).toBeGreaterThan(0);
+    for (const reply of replies) {
+      const replyIndex = records.findIndex(entry => entry.id === reply.id && !entry.method && entry.result);
+      expect(replyIndex).toBeGreaterThan(0); expect(replyIndex).toBeLessThan(cancelIndex);
+    }
+    expect(records.filter(entry => entry.method === "session/cancel")).toHaveLength(1);
+    if (["delivered", "in-flight answer", "handed-off answer"].includes(mode)) {
+      // Keep the person's action as audit evidence; native delivery is a separate fact.
+      expect(h.f.db.prepare("SELECT actor_session FROM mission_control_actions WHERE action_verb='answer'").all()).toContainEqual({ actor_session: mode === "handed-off answer" ? "dana@external" : PERSON });
+    }
+  }, 30_000);
 
   it.each(["pi", "dsh"] as const)("%s process cancels exact E and releases queued F through actual Core routes", async kind => {
     const h = await nativeProcess(kind); h.start(); await h.ready();
@@ -549,6 +663,33 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
     expect(h.entries().filter(entry => "childToken" in entry).every(entry => entry.childToken === false)).toBe(true);
   }, 40000);
 
+  it.each((["pi", "dsh"] as const).flatMap(kind => (["cancel-prepare", "submitted", "result"] as const).flatMap(type => [false, true].map(commit => [kind, type, commit] as const))))
+    ("%s reconciles cancel %s response loss (commit=%s) without repeating native effect", async (kind, type, commit) => {
+    const h = await nativeProcess(kind); h.start(); await h.ready();
+    await h.f.transport.sendNativeWake("dev@channel", "HOLD CANCEL E", "fault-E", "sender");
+    const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+    await h.f.transport.sendNativeWake("dev@channel", "FAULT F", "fault-F", "sender");
+    h.fault = { type, requestId: "fault-cancel", commit, hits: 0 };
+    const body = { type: "cancel", requestId: "fault-cancel", target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } };
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).status).toBe(202);
+    expect(await waitFor(() => h.fault!.hits > 0)).toBe(true);
+    const cancelWrites = () => h.entries().filter(entry => kind === "pi" ? entry.type === "abort" : entry.method === "session/cancel");
+    if (type === "cancel-prepare") { expect(cancelWrites()).toEqual([]); expect(h.f.outbox.runnerReceipt("fault-cancel")?.result).toBeUndefined(); }
+    else {
+      expect(cancelWrites()).toHaveLength(1);
+      expect(await waitFor(() => h.entries().some(entry => { const frame = entry.native as { type?: string; result?: { stopReason?: string } } | undefined; return kind === "pi" ? frame?.type === "agent_end" : frame?.result?.stopReason === "cancelled"; }))).toBe(true);
+      if (type === "submitted") expect(h.f.outbox.runnerReceipt("fault-cancel")?.result?.outcome).toBe(commit ? "requested" : undefined);
+      else expect(h.f.outbox.runnerReceipt("fault-cancel")?.result?.outcome).toBe(commit ? "cancelled" : "requested");
+    }
+    const hellos = h.hellos;
+    if (type === "submitted" && !commit) await h.reopen(); else h.server.closeAllConnections();
+    expect(await waitFor(() => h.hellos > hellos)).toBe(true); h.fault = null;
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("fault-cancel")?.result?.outcome === "cancelled"), h.output).toBe(true);
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("fault-F")?.result?.completion === "completed"), h.output).toBe(true);
+    expect(cancelWrites()).toHaveLength(1); expect(h.prompts()).toEqual(["HOLD CANCEL E", "FAULT F"]);
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).status).toBe(200);
+    expect(cancelWrites()).toHaveLength(1);
+  });
   it.each(["pi", "dsh"] as const)("%s receiver replacement fences missing state and all cross-run/seat authority through actual routes", async kind => {
     const h = await nativeProcess(kind), original = h.start(); await h.ready();
     const post = (token: string, body: unknown) => fetch(`${h.url}/api/activity/runner-channel`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -605,16 +746,82 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
     expect(h.prompts()).toEqual(["SLOW:uncertain"]);
   }, 20000);
 
-  it.runIf(process.env["OPENRIG_NATIVE_PROGRAM_PROOF"] === "1").each(["pi", "dsh"] as const)("installed %s program answers idle and busy queued wakes using only a local fake provider", async kind => {
+  it.each(["pi", "dsh"] as const)("%s loses accepted cancellation map honestly and never replays E into a new receiver/run", async kind => {
+    const h = await nativeProcess(kind), receiver = h.start(); await h.ready();
+    await h.f.transport.sendNativeWake("dev@channel", "HOLD LOST E", "lost-E", "sender");
+    const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+    await h.f.transport.sendNativeWake("dev@channel", "NEVER REPLAY F", "lost-F", "sender");
+    h.fault = { type: "cancel-prepare", requestId: "lost-cancel", commit: false, hits: 0 };
+    const command = { type: "cancel", requestId: "lost-cancel", target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } };
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) })).status).toBe(202);
+    expect(await waitFor(() => h.fault!.hits > 0)).toBe(true); receiver.kill("SIGKILL"); await new Promise(resolve => receiver.once("exit", resolve));
+    h.fault = null; const hellos = h.hellos; const replacement = h.start();
+    expect(await waitFor(() => h.hellos > hellos && h.f.outbox.runnerReceipt("lost-cancel")?.reconciliation === "receiver_state_lost")).toBe(true);
+    expect(h.f.outbox.runnerReceipt("lost-cancel")?.result).toBeUndefined();
+    expect(h.f.channel.currentTurn(h.f.node.id)).toBeNull();
+    expect(h.f.channel.frames(h.f.grant.token, 0)).toEqual([]);
+    expect(h.prompts()).toEqual(["HOLD LOST E"]);
+    const old = h.f.grant;
+    const next = h.f.grants.issue({ nodeId: h.f.node.id, generation: old.generation, issuedBy: "replacement", run: { runId: "next-run", binding: old.binding! } });
+    expect(h.f.grants.activate(next.grantId)).toBe(true);
+    expect(() => h.f.channel.post(old.token, { type: "result", runId: old.runId, requestId: "lost-cancel", sequence: h.f.outbox.runnerReceipt("lost-cancel")!.sequence, result: { kind: "cancel", outcome: "cancelled", confirmed: true } })).toThrow(/revoked/);
+    replacement.kill("SIGKILL"); await new Promise(resolve => replacement.once("exit", resolve));
+    await h.reopen(next); h.start(); await h.ready();
+    expect(h.f.channel.currentTurn(h.f.node.id)).toBeNull();
+    await h.f.transport.sendNativeWake("dev@channel", "NEW RUN F", "new-F", "sender");
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("new-F")?.result?.completion === "completed"), h.output).toBe(true);
+    const late = await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...command, requestId: "old-target-new-run" }) });
+    expect(late.status).toBe(200); expect(h.f.outbox.runnerReceipt("old-target-new-run")?.result?.outcome).toBe("not-this-turn");
+    expect(h.entries().filter(entry => kind === "pi" ? entry.type === "abort" : entry.method === "session/cancel")).toEqual([]);
+    expect(h.prompts()).toEqual(["HOLD LOST E", "NEW RUN F"]);
+  });
+  it.each(["pi", "dsh"] as const)("%s erased cancellation survives Core reopen without reopening E or accepting a late result", async kind => {
+    const h = await nativeProcess(kind); h.start(); await h.ready();
+    await h.f.transport.sendNativeWake("dev@channel", "HOLD ERASE E", "erase-E", "sender");
+    const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+    h.fault = { type: "result", requestId: "erase-cancel", commit: true, hits: 0 };
+    const body = { type: "cancel", requestId: "erase-cancel", target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } };
+    await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("erase-cancel")?.result?.outcome === "cancelled")).toBe(true);
+    const original = h.f.outbox.runnerReceipt("erase-cancel")!; h.f.outbox.eraseRunner(original.requestId, new Date().toISOString());
+    await h.reopen(); h.fault = null; await h.ready();
+    expect(h.f.outbox.runnerReceipt(original.requestId)).toMatchObject({ erasedAt: expect.any(String), bindingHash: original.bindingHash, payload: { target: body.target }, withdrawal: { stage: "confirmed" }, result: { outcome: "cancelled" } });
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).status).toBe(409);
+    expect(() => h.f.channel.post(h.f.grant.token, { type: "result", runId: h.f.grant.runId, requestId: original.requestId, sequence: original.sequence, result: { kind: "cancel", outcome: "cancelled", confirmed: true, detail: "ERASED PRIVATE DATA" } })).toThrow(/erased/);
+    expect(() => h.f.channel.prepareCancellation(h.f.grant.token, { runId: h.f.grant.runId, requestId: original.requestId, sequence: original.sequence }, () => { throw new Error("must never reopen"); })).toThrow();
+    expect(JSON.stringify(h.f.outbox.runnerReceipt(original.requestId))).not.toContain("ERASED PRIVATE DATA");
+    expect(h.entries().filter(entry => kind === "pi" ? entry.type === "abort" : entry.method === "session/cancel")).toHaveLength(1);
+    expect(h.f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_turn_fenced'").get()).toEqual({ n: 1 });
+  });
+  it.each((["pi", "dsh"] as const).flatMap(kind => ["IGNORE", "EXIT"].map(outcome => [kind, outcome] as const)))
+    ("%s native %s after cancel submission never fabricates cancelled", async (kind, outcome) => {
+    const h = await nativeProcess(kind); h.start(); await h.ready();
+    await h.f.transport.sendNativeWake("dev@channel", `SLOW ${outcome} CANCEL E`, "uncertain-E", "sender");
+    const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+    await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "cancel", requestId: "uncertain-cancel", target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } }) });
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("uncertain-cancel")?.result?.outcome === "requested"), h.output).toBe(true);
+    if (outcome === "IGNORE") {
+      expect(await waitFor(() => h.f.outbox.runnerReceipt("uncertain-cancel")?.stage === "completed"), h.output).toBe(true);
+      expect(h.f.outbox.runnerReceipt("uncertain-E")?.result?.completion).toBe("completed");
+    } else await sleep(300);
+    expect(h.f.outbox.runnerReceipt("uncertain-cancel")?.result).toMatchObject({ outcome: "requested", confirmed: false });
+    expect(h.entries().filter(entry => kind === "pi" ? entry.type === "abort" : entry.method === "session/cancel")).toHaveLength(1);
+  });
+  it.runIf(process.env["OPENRIG_NATIVE_PROGRAM_PROOF"] === "1").each(["pi", "dsh"] as const)("installed %s program qualifies input, wake and named cancellation through Core with a local fake provider", async kind => {
     const executable = process.env[kind === "pi" ? "OPENRIG_NATIVE_PI_BIN" : "OPENRIG_NATIVE_DSH_BIN"];
     expect(executable, "Set an explicit isolated native program path for opt-in proof").toBeTruthy();
-    const requests: Array<{ text: string; model: string }> = [];
+    const requests: Array<{ text: string; model: string; history: string }> = [];
+    const held = new Map<string, () => void>();
     const provider = serve({ hostname: "127.0.0.1", port: 0, fetch: async request => {
       if (request.method !== "POST" || !new URL(request.url).pathname.endsWith("/messages")) return new Response(null, { status: 404 });
       const body = await request.json() as { model: string; messages: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }> };
       const content = body.messages.filter(message => message.role === "user").at(-1)?.content;
-      const text = typeof content === "string" ? content : content?.find(part => part.type === "text")?.text ?? "";
-      requests.push({ text, model: body.model });
+      const raw = typeof content === "string" ? content : content?.filter(part => part.type === "text").map(part => part.text ?? "").join("\n") ?? "";
+      // dsh may merge historical E and fresh F into one user message: choose the last owned marker.
+      const marker = [...raw.matchAll(/NATIVE_(?:CANCEL|BUSY)_(?:E|F|STEER)/g)].at(-1)?.[0];
+      const text = marker ?? (typeof content === "string" ? content : content?.find(part => part.type === "text")?.text ?? "");
+      const history = body.messages.filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : message.content.map(part => part.text ?? "").join("\n")).join("\n");
+      requests.push({ text, model: body.model, history });
       const answer = `native-answer: ${text}`;
       const frames = [
         { type: "message_start", message: { id: `offline-${requests.length}`, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
@@ -623,6 +830,13 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
         { type: "content_block_stop", index: 0 },
         { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 10 } }, { type: "message_stop" },
       ];
+      if (marker && !marker.endsWith("STEER")) {
+        const encoder = new TextEncoder(), encode = (frame: { type: string }) => encoder.encode(`event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`);
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+          for (const frame of frames.slice(0, 2)) controller.enqueue(encode(frame));
+          held.set(marker, () => { for (const frame of frames.slice(2)) controller.enqueue(encode(frame)); controller.close(); held.delete(marker); });
+        }, cancel() { held.delete(marker); } }), { headers: { "content-type": "text/event-stream" } });
+      }
       await sleep(text.includes("SLOW:native") ? 700 : 30);
       return new Response(frames.map(frame => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
     } });
@@ -642,8 +856,64 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
     expect(await waitFor(() => h.f.outbox.runnerReceipt("native-b")?.stage === "completed", 12000), h.output).toBe(true);
     for (const [id, text] of [["native-a", "queued native A"], ["native-b", "queued native B"]]) expect(h.f.outbox.runnerReceipt(id!)?.result).toMatchObject({ completion: "completed", answer: `native-answer: ${text}` });
     expect(requests.some(request => request.text === "ordinary native")).toBe(true);
+    const nativeFrames = () => h.entries().flatMap(entry => entry.native ? [entry.native as Record<string, unknown>] : []);
+    for (const busy of kind === "pi" ? [false, true] : [false]) {
+      const label = busy ? "BUSY" : "CANCEL", e = `NATIVE_${label}_E`, f = `NATIVE_${label}_F`, cancelId = `cancel-native-${label}`;
+      if (busy) await h.f.transport.send("dev@channel", e, { deliveryId: `E-${label}`, actorSession: "sender" });
+      else await h.f.transport.sendNativeWake("dev@channel", e, `E-${label}`, "sender");
+      expect(await waitFor(() => held.has(e), 12000), h.output).toBe(true);
+      const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+      if (busy) {
+        await h.f.transport.send("dev@channel", "NATIVE_BUSY_STEER", { deliveryId: "native-owned-steer", actorSession: "sender" });
+        expect(await waitFor(() => nativeFrames().some(frame => frame.type === "queue_update" && (frame.steering as string[] | undefined)?.includes("NATIVE_BUSY_STEER"))), h.output).toBe(true);
+        expect(h.f.outbox.runnerReceipt("native-owned-steer")?.nativeTurnId).toBe(target!.nativeTurnId);
+      }
+      await h.f.transport.sendNativeWake("dev@channel", f, `F-${label}`, "sender");
+      const command = { type: "cancel", requestId: cancelId, target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } };
+      if (!busy) h.fault = { type: "result", requestId: cancelId, commit: true, hits: 0 };
+      expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) })).status).toBe(202);
+      expect(await waitFor(() => h.f.outbox.runnerReceipt(cancelId)?.result?.outcome === "cancelled", 12000), h.output).toBe(true);
+      expect(await waitFor(() => held.has(f), 12000), h.output).toBe(true);
+      if (!busy) { const hello = h.hellos; h.server.closeAllConnections(); expect(await waitFor(() => h.hellos > hello)).toBe(true); h.fault = null; }
+      const calls = () => h.entries().filter(frame => kind === "pi" ? frame.type === "abort" && frame.id === `openrig-cancel-${cancelId}` : frame.method === "session/cancel");
+      const before = calls().length; expect(before).toBe(1);
+      expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) })).status).toBe(200);
+      expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...command, requestId: `late-${cancelId}` }) })).status).toBe(200);
+      expect(h.f.outbox.runnerReceipt(`late-${cancelId}`)?.result?.outcome).toBe("not-this-turn"); expect(calls()).toHaveLength(before);
+      const entries = h.entries();
+      const promptText = (frame: Record<string, unknown>) => kind === "pi" ? frame.message : ((frame.params as { prompt?: Array<{ text?: string }> } | undefined)?.prompt ?? []).map(part => part.text ?? "").join("");
+      expect(entries.filter(frame => promptText(frame) === e)).toHaveLength(1); expect(entries.filter(frame => promptText(frame) === f)).toHaveLength(1);
+      const fIndex = entries.findIndex(frame => promptText(frame) === f);
+      if (kind === "pi") {
+        const ackIndex = entries.findIndex(frame => (frame.native as { type?: string; id?: string; success?: boolean } | undefined)?.type === "response" && (frame.native as { id?: string; success?: boolean }).id === `openrig-cancel-${cancelId}` && (frame.native as { success?: boolean }).success === true);
+        expect(ackIndex).toBeGreaterThan(-1); expect(fIndex).toBeGreaterThan(ackIndex);
+        const eIndex = entries.findIndex(frame => promptText(frame) === e);
+        const aborted = entries.findIndex((frame, index) => index > eIndex && (frame.native as { message?: { stopReason?: string } } | undefined)?.message?.stopReason === "aborted");
+        const ended = entries.findIndex((frame, index) => index > aborted && (frame.native as { type?: string } | undefined)?.type === "agent_end");
+        expect(aborted).toBeGreaterThan(eIndex); expect(ended).toBeGreaterThan(aborted); expect(fIndex).toBeGreaterThan(ended);
+        const empty = entries.findIndex((frame, index) => index > ackIndex && (frame.native as { id?: string; data?: { isStreaming?: boolean; pendingMessageCount?: number } } | undefined)?.id === `openrig-cancel-state-${cancelId}`
+          && (frame.native as { data?: { isStreaming?: boolean; pendingMessageCount?: number } }).data?.isStreaming === false && (frame.native as { data?: { pendingMessageCount?: number } }).data?.pendingMessageCount === 0);
+        expect(empty).toBeGreaterThan(ended); expect(fIndex).toBeGreaterThan(empty);
+        if (busy) {
+          const cleared = entries.findIndex(frame => (frame.native as { id?: string; success?: boolean } | undefined)?.id === `openrig-cancel-clear-${cancelId}` && (frame.native as { success?: boolean }).success === true);
+          expect(cleared).toBeGreaterThan(ackIndex); expect(cleared).toBeGreaterThan(ended); expect(empty).toBeGreaterThan(cleared);
+        }
+      } else {
+        const ePrompt = entries.find(frame => promptText(frame) === e)!;
+        const terminal = entries.findIndex(frame => (frame.native as { id?: unknown; result?: { stopReason?: string } } | undefined)?.id === ePrompt.id && (frame.native as { result?: { stopReason?: string } }).result?.stopReason === "cancelled");
+        expect(terminal).toBeGreaterThan(-1); expect(fIndex).toBeGreaterThan(terminal);
+      }
+      held.get(f)!();
+      expect(await waitFor(() => h.f.outbox.runnerReceipt(`F-${label}`)?.result?.completion === "completed", 12000), h.output).toBe(true);
+      expect(h.f.outbox.runnerReceipt(`F-${label}`)?.result?.answer).toBe(`native-answer: ${f}`);
+      if (kind === "dsh") {
+        const fPrompt = h.entries().find(frame => promptText(frame) === f)!;
+        expect(nativeFrames().find(frame => frame.id === fPrompt.id && (frame.result as { stopReason?: string } | undefined)?.stopReason === "end_turn")).toBeTruthy();
+      }
+      if (busy) expect(requests.find(request => request.text === f)?.history).not.toContain("NATIVE_BUSY_STEER");
+    }
     console.log(JSON.stringify({ nativeProgram: kind, version, executable, provider: "local fake Anthropic messages; no external network", prompts: requests.map(request => request.text) }));
-  }, 45000);
+  }, 60000);
 
   it("pending and replacement grants cannot subscribe to or settle the retiring run's receipts", async () => {
     const f = await fixture(); f.channel.post(f.grant.token, f.hello); cleanups.push(f.channel.connect(f.grant.token)); f.admit("old");
