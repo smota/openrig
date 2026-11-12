@@ -356,6 +356,7 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
 export interface RunnerIo {
   /** Retries transport failures; false means permanent authority/receipt refusal. */
   postRunner?(payload: Record<string, unknown>): Promise<boolean>;
+  withdrawNativeTurn?(payload: Record<string, unknown>): Promise<{ confirmed: boolean; notThisTurn?: boolean; pendingSubmissions?: number } | null>;
   /** Write one JSONL command to pi stdin. */
   sendRpc(cmd: Record<string, unknown>): void;
   /** Print a full line to the pane. */
@@ -478,6 +479,9 @@ export class RunnerCore {
   private nativeTurnSequence = 0;
   private nativeTurnPosts: Promise<unknown> = Promise.resolve();
   private cancellationFence: string | null = null;
+  private cancellation: { entry: PiManagedEntry; target: { runId: string; nativeTurnId: string }; submitted: boolean; acknowledged: boolean; ended: boolean; aborted: boolean } | null = null;
+  private nativeQueues: { steering: string[]; followUp: string[] } | null = null;
+  private readonly epochSteers = new Set<string>();
   private readonly heldPersonPrompts: Record<string, unknown>[] = [];
   private readonly pendingNativeInputs = new Set<PiManagedEntry>();
   /** Pi runs this runner has opened, each posted as an accepted turn (contract section 4): the working beat names it. */
@@ -542,7 +546,7 @@ export class RunnerCore {
   }
   /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
   isReady(): boolean { return this.ready; }
-  nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined && this.runtime === "pi", wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: false }; }
+  nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined && this.runtime === "pi", wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: this.ready && !this.managedQuarantined && this.runtime === "pi" && !!this.io.withdrawNativeTurn }; }
 
   /** Internal preparation only: no abort is submitted and the public capability remains false. */
   prepareNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
@@ -660,9 +664,11 @@ export class RunnerCore {
   async acceptRunnerRequest(frame: PiManagedRequest): Promise<void> {
     if (!this.ready || this.runtime !== "pi" || !this.io.postRunner || frame.version !== 1 || frame.runId !== this.identity.runId
       || !Number.isSafeInteger(frame.sequence) || frame.sequence < 1 || typeof frame.requestId !== "string"
-      || !["input", "wake"].includes(frame.kind) || typeof (frame.kind === "wake" ? frame.payload?.question : frame.payload?.text) !== "string") return;
+      || !["input", "wake", "cancel"].includes(frame.kind)
+      || (frame.kind === "cancel" ? !frame.payload?.target || frame.payload.target.runId !== frame.runId || typeof frame.payload.target.nativeTurnId !== "string"
+        : typeof (frame.kind === "wake" ? frame.payload?.question : frame.payload?.text) !== "string")) return;
     frame = { version: 1, runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, kind: frame.kind,
-      payload: frame.kind === "wake" ? { question: frame.payload.question! } : { text: frame.payload.text! } };
+      payload: frame.kind === "cancel" ? { target: { ...frame.payload.target! } } : frame.kind === "wake" ? { question: frame.payload.question! } : { text: frame.payload.text! } };
     if ([...this.managed.values()].some(entry => entry.frame.sequence === frame.sequence && entry.frame.requestId !== frame.requestId)) throw new Error("Conflicting native sequence");
     const old = this.managed.get(frame.requestId);
     if (old) {
@@ -671,9 +677,18 @@ export class RunnerCore {
     }
     const entry: PiManagedEntry = { frame, state: "accepting", reports: Promise.resolve() };
     this.managed.set(frame.requestId, entry);
+    const named = frame.kind === "cancel" ? frame.payload.target! : null;
+    const prepared = named && !this.cancellation && this.prepareNativeCancellation(named);
+    if (prepared) this.cancellation = { entry, target: named!, submitted: false, acknowledged: false, ended: false, aborted: false };
     entry.acceptance = (async () => {
       const accepted = await this.io.postRunner!({ type: "ack", runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, state: "accepted" });
       if (!accepted) { entry.state = "unavailable"; return; }
+      if (named) {
+        entry.state = "queued";
+        if (!prepared) { entry.state = "terminal"; this.reportManaged(entry, "result", { kind: "cancel", outcome: this.nativeTurn?.id === named.nativeTurnId ? "not-supported" : "not-this-turn", confirmed: false }); }
+        else void this.performNativeCancellation(this.cancellation!).catch(() => {});
+        return;
+      }
       entry.state = "queued"; this.managedQueue.push(entry); this.managedQueue.sort((a, b) => a.frame.sequence - b.frame.sequence); this.pumpManaged();
     })();
     await entry.acceptance;
@@ -685,6 +700,37 @@ export class RunnerCore {
     entry.reports = entry.reports.then(() => this.io.postRunner?.({ type, runId: f.runId, requestId: f.requestId, sequence: f.sequence,
       ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}),
       ...(entry.acceptedTurnId ? { acceptedTurnId: entry.acceptedTurnId } : {}), ...(result ? { result } : {}) })).catch(() => {});
+  }
+
+  private async performNativeCancellation(operation: NonNullable<RunnerCore["cancellation"]>): Promise<void> {
+    const { entry, target } = operation;
+    if (!this.io.withdrawNativeTurn) { this.finishNativeCancellation("not-supported"); return; }
+    for (;;) {
+      const withdrawal = await this.io.withdrawNativeTurn({ type: "cancel-prepare", runId: entry.frame.runId, requestId: entry.frame.requestId, sequence: entry.frame.sequence });
+      if (!this.nativeTurn || this.nativeTurn.id !== target.nativeTurnId || withdrawal?.notThisTurn) { this.finishNativeCancellation("not-this-turn"); return; }
+      if (withdrawal?.confirmed) break;
+      if (!this.ready || this.cancellation !== operation) return;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    if (!this.ready || this.managedQuarantined || this.nativeTurn?.id !== target.nativeTurnId) { this.finishNativeCancellation("not-this-turn"); return; }
+    operation.submitted = true;
+    entry.state = "submitted";
+    this.io.sendRpc({ type: "abort", id: `openrig-cancel-${entry.frame.requestId}` });
+    this.reportManaged(entry, "submitted", { kind: "cancel", outcome: "requested", confirmed: false, operationAccepted: false });
+  }
+
+  private finishNativeCancellation(outcome: "cancelled" | "requested" | "not-this-turn" | "not-supported", detail?: string): void {
+    const operation = this.cancellation; if (!operation) return;
+    operation.entry.state = "terminal";
+    this.reportManaged(operation.entry, "result", { kind: "cancel", outcome, confirmed: outcome === "cancelled", operationAccepted: operation.acknowledged, ...(detail ? { detail } : {}) });
+    this.cancellation = null; this.cancellationFence = null;
+    this.pumpPersonPrompts(); this.pumpManaged();
+  }
+
+  private checkCancelledNativeIdle(): void {
+    const operation = this.cancellation;
+    if (operation?.submitted && operation.acknowledged && operation.ended)
+      this.io.sendRpc({ type: "get_state", id: `openrig-cancel-state-${operation.entry.frame.requestId}` });
   }
 
   private pumpManaged(): void {
@@ -705,6 +751,7 @@ export class RunnerCore {
     if (!this.streaming) this.pendingManagedStart = true;
     const id = `openrig-native-${entry.frame.requestId}`;
     this.managedRpc.set(id, entry);
+    if (this.streaming && entry.frame.kind === "input") this.epochSteers.add(entry.frame.payload.text!);
     this.io.sendRpc({ id, type: "prompt", message: entry.frame.kind === "wake" ? entry.frame.payload.question! : entry.frame.payload.text!, streamingBehavior: "steer" });
     this.acceptIntoOpenRun();
     if (this.nativeTurn) { entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn); }
@@ -738,6 +785,7 @@ export class RunnerCore {
     const id = `openrig-person-${++this.promptRevision}`;
     this.personPreflights.add(id);
     if (!this.streaming) this.pendingManagedStart = true;
+    if (this.streaming && typeof command.message === "string") this.epochSteers.add(command.message);
     this.io.sendRpc({ ...command, id });
   }
 
@@ -779,6 +827,7 @@ export class RunnerCore {
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
+    if (this.cancellation) this.finishNativeCancellation(this.cancellation.submitted ? "requested" : "not-this-turn", "native_process_exited");
     if (this.managedWake) this.finishManagedWake(this.managedWake, "failed");
     this.reportDroppedFrame(this.frameDecoder?.incomplete());
     this.io.mirrorLine(`[${this.runtime}-runner] EXITED ${this.runtime} exited (code ${code ?? "unknown"})`);
@@ -787,6 +836,28 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    const cancellation = this.cancellation;
+    if (cancellation && record.id === `openrig-cancel-${cancellation.entry.frame.requestId}`) {
+      if (record.success === true) { cancellation.acknowledged = true; this.checkCancelledNativeIdle(); }
+      return;
+    }
+    if (cancellation && record.id === `openrig-cancel-clear-${cancellation.entry.frame.requestId}`) {
+      if (record.success === true) this.checkCancelledNativeIdle();
+      return;
+    }
+    if (cancellation && record.id === `openrig-cancel-state-${cancellation.entry.frame.requestId}`) {
+      const state = record.data as { isStreaming?: boolean; pendingMessageCount?: number } | undefined;
+      if (record.success === true && state?.isStreaming === false && state.pendingMessageCount === 0) {
+        this.finishNativeCancellation(cancellation.aborted ? "cancelled" : "requested", cancellation.aborted ? undefined : "native_end_without_cancellation_proof");
+      } else if (record.success === true && state?.isStreaming === false && Number(state.pendingMessageCount) > 0
+        && this.nativeQueues && this.nativeQueues.followUp.length === 0 && this.nativeQueues.steering.length === state.pendingMessageCount
+        && this.nativeQueues.steering.every(text => this.epochSteers.has(text))) {
+        this.io.sendRpc({ type: "clear_queue", id: `openrig-cancel-clear-${cancellation.entry.frame.requestId}` });
+      }
+      // Unknown native queue/state keeps the successor fence; timeouts never release it.
+      return;
+    }
+
     if (this.idleQuery && record.id === this.idleQuery.id) {
       const query = this.idleQuery; this.idleQuery = null;
       const data = record.data as { isStreaming?: boolean; pendingMessageCount?: number } | undefined;
@@ -1060,6 +1131,17 @@ export class RunnerCore {
   }
 
   private handleEvent(event: Record<string, unknown>): void {
+    if (event.type === "queue_update") {
+      this.nativeQueues = Array.isArray(event.steering) && event.steering.every(text => typeof text === "string")
+        && Array.isArray(event.followUp) && event.followUp.every(text => typeof text === "string")
+        ? { steering: event.steering as string[], followUp: event.followUp as string[] } : null;
+    }
+    if (this.cancellation?.submitted && this.nativeTurn?.id === this.cancellation.target.nativeTurnId) {
+      const message = event.message as { role?: string; stopReason?: string } | undefined;
+      if (event.type === "message_end" && message?.role === "assistant" && message.stopReason === "aborted") this.cancellation.aborted = true;
+      if (event.type === "agent_end") this.cancellation.ended = true;
+    }
+
     if (event.type === "extension_ui_request") {
       const method = event.method;
       const dialog = method === "select" || method === "confirm" || method === "input" || method === "editor";
@@ -1133,6 +1215,7 @@ export class RunnerCore {
     if (opening) {
       setImmediate(() => this.pumpManaged());
       this.turn += 1;
+      this.epochSteers.clear(); this.nativeQueues = null;
       this.nativeTurn = { id: `pi-invocation-${++this.nativeEpoch}`, accepted: [String(this.turn)], owned: this.pendingManagedStart };
       this.reportNativeTurn("opened");
       for (const entry of this.pendingNativeInputs) {
@@ -1151,6 +1234,7 @@ export class RunnerCore {
       this.idleRevision = -1;
       this.pendingManagedStart = false;
       this.reportNativeTurn("closed"); this.nativeTurn = null;
+      this.checkCancelledNativeIdle();
       if (wake) { wake.nativeTerminal = true; this.finishManagedWake(wake); }
       setImmediate(() => { this.pumpPersonPrompts(); this.pumpManaged(); });
       // QA RED fold: live events do not reliably carry
@@ -1774,7 +1858,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   child.once("exit", () => { nativeStream.abort(); setTimeout(() => nativePosts.abort(), 2000).unref(); });
   child.once("error", () => { nativeStream.abort(); nativePosts.abort(); });
   const io: RunnerIo = {
-    ...(runtime === "pi" && endpoint && process.env.OPENRIG_RUN_ID ? { postRunner: (body: Record<string, unknown>) => postPiRunnerChannel(endpoint, body, nativePosts.signal) } : {}),
+    ...(runtime === "pi" && endpoint && process.env.OPENRIG_RUN_ID ? { postRunner: (body: Record<string, unknown>) => postPiRunnerChannel(endpoint, body, nativePosts.signal),
+      withdrawNativeTurn: async (body: Record<string, unknown>) => {
+        try {
+          const response = await fetch(`${endpoint.baseUrl}/api/activity/runner-channel`, { method: "POST", signal: AbortSignal.timeout(3000),
+            headers: { authorization: `Bearer ${endpoint.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+          if (!response.ok) return null;
+          return (await response.json() as { withdrawal?: { confirmed: boolean; notThisTurn?: boolean } }).withdrawal ?? null;
+        } catch { return null; }
+      } } : {}),
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
     },
