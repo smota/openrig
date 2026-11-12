@@ -457,6 +457,7 @@ interface PiManagedEntry {
   frame: PiManagedRequest; acceptance?: Promise<void>; state: "accepting" | "queued" | "writing" | "submitted" | "terminal" | "unavailable";
   reports: Promise<unknown>; nativeAccepted?: boolean; terminalResult?: Record<string, unknown>; wakeOpened?: boolean; contaminated?: boolean; answer?: string[]; stopReason?: string;
   disposition?: string; preDispositionEvents?: boolean; nativeTerminal?: boolean;
+  acceptedTurnId?: string; nativeTurnId?: string;
 }
 
 export class RunnerCore {
@@ -472,6 +473,13 @@ export class RunnerCore {
   private idleQuery: { id: string; revision: number } | null = null;
   private nativeQueueStateAvailable = false;
   private streaming = false;
+  private nativeEpoch = 0;
+  private nativeTurn: { id: string; accepted: string[]; owned: boolean } | null = null;
+  private nativeTurnSequence = 0;
+  private nativeTurnPosts: Promise<unknown> = Promise.resolve();
+  private cancellationFence: string | null = null;
+  private readonly heldPersonPrompts: Record<string, unknown>[] = [];
+  private readonly pendingNativeInputs = new Set<PiManagedEntry>();
   /** Pi runs this runner has opened, each posted as an accepted turn (contract section 4): the working beat names it. */
   private turn = 0;
   private sessionFile: string | undefined;
@@ -535,6 +543,37 @@ export class RunnerCore {
   /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
   isReady(): boolean { return this.ready; }
   nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined && this.runtime === "pi", wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: false }; }
+
+  /** Internal preparation only: no abort is submitted and the public capability remains false. */
+  prepareNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
+    if (this.runtime !== "pi" || !this.ready || this.managedQuarantined || !this.nativeTurn
+      || !this.nativeTurn.owned || target.runId !== this.identity.runId || target.nativeTurnId !== this.nativeTurn.id
+      || this.cancellationFence && this.cancellationFence !== target.nativeTurnId) return false;
+    this.cancellationFence = target.nativeTurnId;
+    return true;
+  }
+
+  /** After withdrawal, retain E's fence if still live; release only a pre-submit mismatch. */
+  recheckNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
+    if (target.runId !== this.identity.runId || this.cancellationFence !== target.nativeTurnId) return false;
+    if (this.nativeTurn?.id === target.nativeTurnId) return true;
+    this.cancellationFence = null;
+    this.pumpPersonPrompts(); this.pumpManaged();
+    return false;
+  }
+
+  private reportNativeTurn(state: "opened" | "closed"): void {
+    if (!this.nativeTurn || !this.identity.runId || !this.io.postRunner || this.runtime !== "pi") return;
+    const body = { type: "turn", runId: this.identity.runId, sequence: ++this.nativeTurnSequence,
+      nativeTurnId: this.nativeTurn.id, state, acceptedTurnIds: [...this.nativeTurn.accepted] };
+    this.nativeTurnPosts = this.nativeTurnPosts.then(() => this.io.postRunner!(body)).catch(() => {});
+  }
+
+  private pumpPersonPrompts(): void {
+    if (this.cancellationFence || this.streaming || this.pendingManagedStart || !this.ready || this.managedQuarantined) return;
+    const command = this.heldPersonPrompts.shift();
+    if (command) this.personPrompt(command.type === "follow_up" ? { type: "prompt", message: command.message, streamingBehavior: "steer" } : command);
+  }
 
   /** Kick off identity capture. Called once pi's RPC stream is up; for OMP, with its `ready` frame. */
   start(ready?: Record<string, unknown>): void {
@@ -644,11 +683,12 @@ export class RunnerCore {
     const f = entry.frame;
     if (type !== "submitted" && result) entry.terminalResult = result;
     entry.reports = entry.reports.then(() => this.io.postRunner?.({ type, runId: f.runId, requestId: f.requestId, sequence: f.sequence,
-      ...(f.kind === "wake" ? { nativeTurnId: `pi-wake-${f.requestId}` } : {}), ...(result ? { result } : {}) })).catch(() => {});
+      ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}),
+      ...(entry.acceptedTurnId ? { acceptedTurnId: entry.acceptedTurnId } : {}), ...(result ? { result } : {}) })).catch(() => {});
   }
 
   private pumpManaged(): void {
-    if (!this.ready || this.managedQuarantined || this.managedWake || this.pendingManagedStart && !this.streaming) return;
+    if (!this.ready || this.cancellationFence || this.managedQuarantined || this.managedWake || this.pendingManagedStart && !this.streaming) return;
     const entry = this.managedQueue[0];
     if (!entry || this.personPreflights.size || [...this.managed.values()].some(prior => prior.state === "accepting" && prior.frame.sequence < entry.frame.sequence)
       || entry.frame.kind === "wake" && (this.streaming || this.pendingManagedStart)) return;
@@ -667,6 +707,8 @@ export class RunnerCore {
     this.managedRpc.set(id, entry);
     this.io.sendRpc({ id, type: "prompt", message: entry.frame.kind === "wake" ? entry.frame.payload.question! : entry.frame.payload.text!, streamingBehavior: "steer" });
     this.acceptIntoOpenRun();
+    if (this.nativeTurn) { entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn); }
+    else this.pendingNativeInputs.add(entry);
     // Ordinary busy messages may steer; the next queued wake waits for agent_end, not this RPC response.
     this.pumpManaged();
   }
@@ -680,7 +722,7 @@ export class RunnerCore {
     const completion = ownershipUnknown || forced && !entry.nativeAccepted ? "unknown" : forced ?? (entry.contaminated || !entry.wakeOpened ? "unknown"
       : entry.stopReason === "stop" && entry.answer?.some(text => text.length > 0) ? "completed" : entry.stopReason === "aborted" ? "interrupted" : entry.stopReason === "error" ? "failed" : "unknown");
     entry.state = "terminal";
-    entry.terminalResult = { kind: "wake", nativeTurnId: `pi-wake-${entry.frame.requestId}`,
+    entry.terminalResult = { kind: "wake", ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}),
       completion, answer: completion === "completed" ? entry.answer?.join("\n") ?? "" : null,
       ...(ownershipUnknown ? { ownershipUnknown: true } : {}),
       ...(forced && !entry.nativeAccepted ? { submissionUnknown: true } : {}) };
@@ -690,6 +732,9 @@ export class RunnerCore {
 
   private personPrompt(command: Record<string, unknown>): void {
     if (this.runtime !== "pi" || !this.io.postRunner) { this.io.sendRpc(command); return; }
+    if (this.cancellationFence || command.type === "follow_up" && (this.streaming || this.pendingManagedStart)) {
+      this.heldPersonPrompts.push(command); return;
+    }
     const id = `openrig-person-${++this.promptRevision}`;
     this.personPreflights.add(id);
     if (!this.streaming) this.pendingManagedStart = true;
@@ -708,7 +753,7 @@ export class RunnerCore {
       const message = block.slice("/followup ".length);
       this.personPrompt({ type: "follow_up", message });
       this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
-      this.acceptIntoOpenRun();
+      if (!this.io.postRunner) this.acceptIntoOpenRun();
       return;
     }
     // The runtime decides, not the runner: with streamingBehavior "steer", Pi and OMP run the prompt when idle and,
@@ -717,7 +762,7 @@ export class RunnerCore {
     // when a prompt was consumed locally and started none. It labels the mirror line only.
     this.personPrompt({ type: "prompt", message: block, streamingBehavior: "steer" });
     this.io.mirrorLine(this.streaming ? `you (steer) ▸ ${block}` : `you ▸ ${block}`);
-    this.acceptIntoOpenRun();
+    if (!this.cancellationFence) this.acceptIntoOpenRun();
   }
 
   /** A working beat counts only for the latest accepted turn, and each prompt the runner gives the agent is accepted with
@@ -727,6 +772,7 @@ export class RunnerCore {
   private acceptIntoOpenRun(): void {
     if (this.runtime === "omp" || !this.streaming) return;
     this.turn += 1;
+    if (this.nativeTurn) { this.nativeTurn.accepted.push(String(this.turn)); this.reportNativeTurn("opened"); }
     this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
   }
 
@@ -757,7 +803,7 @@ export class RunnerCore {
     }
     if (typeof record.id === "string" && this.personPreflights.delete(record.id)) {
       if (record.success !== true || (record.data as { disposition?: string } | undefined)?.disposition === "handled") this.pendingManagedStart = false;
-      this.pumpManaged(); return;
+      this.pumpPersonPrompts(); this.pumpManaged(); return;
     }
     const managed = typeof record.id === "string" ? this.managedRpc.get(record.id) : undefined;
     if (managed) {
@@ -1066,11 +1112,19 @@ export class RunnerCore {
     // A working beat counts only for the latest accepted turn. Pi's runs start from this runner's prompts, so the run
     // that opens is posted as one, before its first event; a prompt Pi handles without a run opens none. A prompt sent
     // into an open run is accepted as it's sent (acceptIntoOpenRun).
+    if (this.runtime === "pi" && event.type === "agent_start" && this.nativeTurn) this.managedQuarantined = true;
     const opening = this.runtime !== "omp" && mapped.streaming === true && !this.streaming;
     if (mapped.streaming !== undefined) this.streaming = mapped.streaming;
     if (opening) {
       setImmediate(() => this.pumpManaged());
       this.turn += 1;
+      this.nativeTurn = { id: `pi-invocation-${++this.nativeEpoch}`, accepted: [String(this.turn)], owned: this.pendingManagedStart };
+      this.reportNativeTurn("opened");
+      for (const entry of this.pendingNativeInputs) {
+        entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn);
+        if (entry.terminalResult) this.reportManaged(entry, "result", entry.terminalResult);
+      }
+      this.pendingNativeInputs.clear();
       this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
     }
     // OMP writes its JSONL lazily; re-announce identity after each turn until
@@ -1079,8 +1133,9 @@ export class RunnerCore {
     if (event.type === "agent_end") {
       this.idleRevision = -1;
       this.pendingManagedStart = false;
+      this.reportNativeTurn("closed"); this.nativeTurn = null;
       if (wake) { wake.nativeTerminal = true; this.finishManagedWake(wake); }
-      setImmediate(() => this.pumpManaged());
+      setImmediate(() => { this.pumpPersonPrompts(); this.pumpManaged(); });
       // QA RED fold: live events do not reliably carry
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
       // null in real runs). Refresh it from the source of truth after every
