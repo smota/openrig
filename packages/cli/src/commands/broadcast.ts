@@ -222,9 +222,12 @@ async function runCrossHostBroadcast(
  *  local route does, so per-target honesty prints identically. A partial
  *  fan-out sets a non-zero exit either way. */
 function renderBroadcastResults(data: Record<string, unknown>): void {
-  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; inputPhase?: string; sent?: boolean; managedCompaction?: { notice?: unknown } }>) ?? [];
+  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; inputPhase?: string; sent?: boolean; runnerReceipt?: { requestId: string; stage: string; reconciliation?: string; erasedAt?: string; result?: { submissionUnknown?: boolean } }; managedCompaction?: { notice?: unknown } }>) ?? [];
   for (const r of results) {
-    if (r.ok) {
+    if (r.runnerReceipt) {
+      const receipt = r.runnerReceipt;
+      console.log(`${r.sessionName}: ${receipt.reconciliation || receipt.erasedAt || receipt.result?.submissionUnknown ? "native effect unknown" : `native receipt ${receipt.stage}`}; request ${receipt.requestId}`);
+    } else if (r.ok) {
       console.log(`${r.sessionName}: sent`);
     } else if (r.inputPhase === "attempted" || r.inputPhase === "written" || r.sent === true) {
       // The daemon records this recipient's receipt as indeterminate (#2507): its text or Enter may have reached it.
@@ -235,7 +238,7 @@ function renderBroadcastResults(data: Record<string, unknown>): void {
     }
     if (typeof r.managedCompaction?.notice === "string") console.log(`Notice: ${r.managedCompaction.notice}`);
   }
-  console.log(`${data["sent"]}/${data["total"]} delivered`);
+  console.log(`${data["sent"]}/${data["total"]} delivered${data["pendingNative"] ? `; ${data["pendingNative"]} native pending` : ""}${data["indeterminateNative"] ? `; ${data["indeterminateNative"]} native effect unknown` : ""}`);
   // S2 (OPR.0.5.4.3): surface additive advisories (e.g. the unknown-sender
   // sign-it notice) — an env-less operator must see it, not "sent" lines alone.
   const advisory = data["warning"] as string | undefined;
@@ -243,7 +246,7 @@ function renderBroadcastResults(data: Record<string, unknown>): void {
     console.log(`Advisory: ${advisory}`);
   }
 
-  if ((data["failed"] as number) > 0 || results.some((r) => !r.ok)) {
+  if ((data["failed"] as number) > 0 || (data["indeterminateNative"] as number) > 0 || results.some((r) => !r.ok)) {
     process.exitCode = 1;
   }
 }
