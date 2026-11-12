@@ -225,7 +225,7 @@ describe("the conformance check's test double against OpenRig's real permission 
 
 describe("run-bound native channel custody", () => {
   async function fixture(enabled = true, runtime = "pi", runner = 2, file?: string,
-    retained?: { node: { id: string }; grant: import("../src/domain/activity-grants.js").ActivityGrant & { token: string } }) {
+    retained?: { node: { id: string }; grant: import("../src/domain/activity-grants.js").ActivityGrant & { token: string } }, observations = false) {
     const { RunnerChannel } = await import("../src/domain/runner-channel.js");
     const { ActivityGrantStore } = await import("../src/domain/activity-grants.js");
     const db = createDb(file); migrate(db, ALL_MIGRATIONS); cleanups.push(() => { if (db.open) db.close(); });
@@ -248,18 +248,26 @@ describe("run-bound native channel custody", () => {
     const guard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
     const tmux = { deliveryGuard: guard };
     const transport = new SessionTransport({ db, rigRepo: rigs, sessionRegistry: registry, tmuxAdapter: tmux as never, runnerChannel: channel });
+    // Combined validation only: keep the normal native fixture unchanged unless a cross-topic test opts in.
+    const reports = observations ? new AgentActivityStore({ db, eventBus: new EventBus(db),
+      resolveOccupantGeneration: id => registry.currentOccupantTenure(id)?.generationUuid ?? null,
+      isRegisteredOccupantGeneration: (id, generation) => registry.isOccupantGenerationRegistered(id, generation) }) : undefined;
     const app = new Hono();
     app.use("*", async (c, next) => {
       c.set("runnerChannel" as never, channel); c.set("rigRepo" as never, rigs);
+      if (reports) {
+        c.set("agentActivityStore" as never, reports); c.set("sessionRegistry" as never, registry);
+        c.set("activityHookToken" as never, INSTALL);
+      }
       c.set("tmuxAdapter" as never, tmux); c.set("sessionTransport" as never, transport); await next();
     });
     app.route("/api/activity", activityRoutes); app.route("/api/seat", seatRoutes);
     const hello = { type: "hello", version: 1, runId: "run-one", retained: true, capabilities: { input: true, wake: true, cancel: true } };
     const admit = (id: string) => channel.admit(grant.nodeId, { outboxId: id, senderSession: "sender", destinationSession: "dev@channel", body: id,
       kind: "input", inputRoute: "native", payload: { text: id } });
-    return { db, node, grant, grants, outbox, channel, hello, admit, app, guard, transport };
+    return { db, node, grant, grants, outbox, channel, hello, admit, app, guard, transport, reports };
   }
-  async function nativeProcess(kind: "pi" | "dsh", program?: { bin: string; providerUrl: string }) {
+  async function nativeProcess(kind: "pi" | "dsh", program?: { bin: string; providerUrl: string }, observations = false) {
     const dir = mkdtempSync(join(tmpdir(), `native-recovery-${kind}-`)), file = join(dir, "core.sqlite"), log = join(dir, "native.log");
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const { mkdirSync, unlinkSync, symlinkSync } = await import("node:fs"); const bin = join(dir, "bin"); mkdirSync(bin);
@@ -287,7 +295,7 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
       const agent = join(dir, "state", "dev@channel", "agent"); mkdirSync(agent, { recursive: true });
       writeFileSync(join(agent, "models.json"), JSON.stringify({ providers: { local: { baseUrl: program.providerUrl, api: "anthropic-messages", apiKey: "offline-dummy", models: [{ id: "fixture-model", name: "Offline fixture", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
     }
-    let current = await fixture(true, kind, kind === "pi" ? 0 : 1, file);
+    let current = await fixture(true, kind, kind === "pi" ? 0 : 1, file, undefined, observations);
     let fault: { type: string; commit: boolean; hits: number } | null = null;
     let lookupDelay = 0;
     let hellos = 0;
@@ -320,7 +328,7 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
     const reopen = async (grant = current.grant) => {
       server.closeAllConnections(); await sleep(50);
       const retained = { node: current.node, grant }; current.db.close();
-      current = await fixture(true, kind, kind === "pi" ? 0 : 1, file, retained);
+      current = await fixture(true, kind, kind === "pi" ? 0 : 1, file, retained, observations);
     };
     const entries = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
     const prompts = () => entries().filter(entry => kind === "pi" ? entry.type === "prompt" : entry.method === "session/prompt")
@@ -328,6 +336,99 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
     return { start, ready, reopen, url, server, prompts, entries, dir, get output() { return output; }, get f() { return current; }, get hellos() { return hellos; },
       get fault() { return fault; }, set fault(value) { fault = value; }, set lookupDelay(value: number) { lookupDelay = value; } };
   }
+
+  it("combined validation: runner observations and native wake share authority without sharing sequence or upgrading identity", async () => {
+    const h = await nativeProcess("dsh", undefined, true); h.start(); await h.ready();
+    const { SeatIdentityStore } = await import("../src/domain/seat-identity-store.js");
+    const { CurrentModelReader } = await import("../src/domain/model-divergence/current-model-reader.js");
+    const { ContextUsageStore } = await import("../src/domain/context-usage-store.js");
+    const registry = new SessionRegistry(h.f.db), identities = new SeatIdentityStore(h.f.db);
+    const existing = h.f.db.prepare("SELECT resume_token FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1")
+      .get(h.f.node.id) as { resume_token: string | null };
+    const nativeRef = existing.resume_token ?? "native-fixture";
+    const report = { runId: h.f.grant.runId, sequence: 1, occurredAt: new Date().toISOString(),
+      observations: { session: { nativeRef }, model: { id: "reported/model" }, context: { usedTokens: 100, windowTokens: 1000 } } };
+    const post = async (body: object) => {
+      const response = await fetch(`${h.url}/api/activity/hooks`, { method: "POST",
+        headers: { authorization: `Bearer ${h.f.grant.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() };
+    };
+    const accepted = await post(report);
+    expect(accepted).toMatchObject({ status: 200, body: { observation: { family: "observation", sequence: 1 } } });
+    const reader = new CurrentModelReader({ sessions: registry, identities, runnerObservations: h.f.reports,
+      context: { readSidecar: () => ({ ok: false }) } as never,
+      census: { cycleLister: () => async () => [] } as never, codexRollout: () => null, piRunner: () => null as never,
+      native: { getPanePid: async () => null, listProcesses: async () => [] } });
+    expect(await reader.observe({ nodeId: h.f.node.id, canonicalSessionName: "dev@channel", runtime: "dsh", sessionStatus: "running" }))
+      .toMatchObject({ status: "observed", model: "reported/model", source: "runner_reported" });
+    const context = new ContextUsageStore(h.f.db, { stateDir: h.dir, runnerObservations: h.f.reports });
+    expect(context.getForNode(h.f.node.id, "dev@channel")).toMatchObject({ availability: "known", source: "runner_reported", usedPercentage: 10 });
+    expect(identities.getForNode(h.f.node.id)?.verdict).not.toBe("verified");
+    expect(h.f.db.prepare("SELECT resume_token,resume_last_verified FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(h.f.node.id))
+      .toEqual({ resume_token: nativeRef, resume_last_verified: null });
+    await h.f.transport.sendNativeWake("dev@channel", "combined-wake", "combined-wake", "sender");
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("combined-wake")?.stage === "completed"), h.output).toBe(true);
+    expect(h.f.outbox.runnerReceipt("combined-wake")).toMatchObject({ sequence: 1, result: { answer: "answer combined-wake" } });
+    expect(h.prompts()).toEqual(["combined-wake"]);
+    expect(await post(report)).toEqual(accepted);
+    expect(h.f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_observation'").get()).toEqual({ n: 1 });
+    // A differing report is retained as reported evidence, not used to replace the known Core reference.
+    expect((await post({ ...report, sequence: 2, occurredAt: new Date().toISOString(), observations: {
+      session: { nativeRef: "different-reported-reference" }, model: { id: "different/model" } } })).status).toBe(200);
+    expect(h.f.db.prepare("SELECT resume_token,resume_last_verified FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(h.f.node.id))
+      .toEqual({ resume_token: nativeRef, resume_last_verified: null });
+    expect(h.f.reports!.getRunnerObservation(h.f.node.id, "model", { freshnessMs: 600_000 }))
+      .toEqual({ report: null, reason: "session_mismatch" });
+    expect(h.f.outbox.runnerReceipt("combined-wake")?.stage).toBe("completed");
+    expect(h.f.grants.standing(h.f.grant.grantId)).toBe("current");
+  }, 20000);
+
+  it.each(["pi", "dsh"] as const)("combined validation: %s unverified binding preserves observation sequence and pending native result through recovery", async kind => {
+    const h = await nativeProcess(kind, undefined, true);
+    const { SeatIdentityStore } = await import("../src/domain/seat-identity-store.js");
+    const identities = new SeatIdentityStore(h.f.db);
+    const evidence = { nodeId: h.f.node.id, verdict: "unconfirmed" as const, evidenceSource: "pane_process" as const, reason: null,
+      sessionName: "dev@channel", observedAt: new Date().toISOString(), evidence: { registeredPane: "%1", observedPid: 101,
+        observedPanePid: 101, observedCommand: "node", matchedLayer: null } };
+    identities.upsert(evidence);
+    new SessionRegistry(h.f.db).registerClaimedSession(h.f.node.id, "dev@channel", "adopt");
+    const post = async (body: object) => {
+      const response = await fetch(`${h.url}/api/activity/hooks`, { method: "POST",
+        headers: { authorization: `Bearer ${h.f.grant.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() };
+    };
+    expect((await post({ runId: h.f.grant.runId, sequence: 1, occurredAt: new Date().toISOString(),
+      observations: { model: { id: "before-verification" } } })).status).toBe(200);
+    h.start(); await h.ready();
+    h.fault = { type: "result", commit: false, hits: 0 };
+    await h.f.transport.sendNativeWake("dev@channel", "combined-pending", "combined-pending", "sender");
+    expect(await waitFor(() => h.fault!.hits > 0), h.output).toBe(true);
+    const saved = h.f.outbox.runnerReceipt("combined-pending")!;
+    expect(saved.stage).toBe("submitted"); expect(h.prompts()).toEqual(["combined-pending"]);
+    h.f.db.prepare("DELETE FROM seat_identity_verdicts WHERE node_id=?").run(h.f.node.id);
+    h.fault = null; const hellos = h.hellos; h.server.closeAllConnections();
+    expect(await waitFor(() => h.hellos > hellos), h.output).toBe(true);
+    const report = { runId: h.f.grant.runId, sequence: 2, occurredAt: new Date().toISOString(),
+      observations: { model: { id: "after-verification" }, context: { usedTokens: 1, windowTokens: 10 } } };
+    expect(await post(report)).toMatchObject({ status: 409, body: { code: "activity_grant_unverified", retryable: true } });
+    expect(h.f.reports!.getRunnerObservation(h.f.node.id, "model", { freshnessMs: 600_000 }))
+      .toEqual({ report: null, reason: "binding_unverified" });
+    expect(h.f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_observation'").get()).toEqual({ n: 1 });
+    expect(h.f.outbox.runnerReceipt("combined-pending")).toEqual(saved);
+    expect(h.f.grants.get(h.f.grant.grantId)?.revokedAt).toBeNull();
+    expect(h.prompts()).toEqual(["combined-pending"]);
+    identities.upsert(evidence); await h.ready();
+    expect(await waitFor(() => h.f.outbox.runnerReceipt("combined-pending")?.stage === "completed"), h.output).toBe(true);
+    const accepted = await post(report);
+    expect(accepted).toMatchObject({ status: 200, body: { observation: { family: "observation", sequence: 2 } } });
+    expect(await post(report)).toEqual(accepted);
+    expect(h.f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_observation'").get()).toEqual({ n: 2 });
+    expect(h.f.reports!.getRunnerObservation(h.f.node.id, "model", { freshnessMs: 600_000 }))
+      .toMatchObject({ report: { sequence: 2, observations: { model: { id: "after-verification" } } }, reason: null });
+    expect(h.f.outbox.runnerReceipt("combined-pending")?.result).toMatchObject({ answer: "answer combined-pending" });
+    expect(h.prompts()).toEqual(["combined-pending"]);
+    expect(h.f.grants.standing(h.f.grant.grantId)).toBe("current");
+  }, 25000);
 
   it.each(["pi", "dsh"] as const)("%s process recovers every custody window through actual Core routes with one native effect", async kind => {
     const h = await nativeProcess(kind); h.start(); await h.ready();
