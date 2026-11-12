@@ -1,3 +1,4 @@
+import { EventBus } from "./event-bus.js";
 import { AGENT_RUNNER_PRESET, AGENT_RUNNER_HOSTED_PI_RPC } from "./session-registry.js";
 import { ActivityGrantStore, type ActivityGrant, type RunGrantBinding } from "./activity-grants.js";
 import { OutboxHandler, OutboxHandlerError, type RunnerAdmission, type RunnerReceipt } from "./outbox-handler.js";
@@ -21,7 +22,8 @@ export class RunnerChannel {
   private readonly listeners = new Set<() => void>();
   // Implemented contract families, not program names or inferred qualification of compatible forks.
   constructor(private readonly grants: ActivityGrantStore, readonly outbox: OutboxHandler,
-    private readonly implementedKinds: ReadonlySet<string> = new Set(["managed-pi", "preset"])) {}
+    private readonly implementedKinds: ReadonlySet<string> = new Set(["managed-pi", "preset"]),
+    private readonly events = new EventBus(outbox.db)) {}
 
   authenticate(token: string | undefined): ActivityGrant & { runId: string } {
     const grant = this.grants.authenticate(token);
@@ -68,6 +70,7 @@ export class RunnerChannel {
         maximumSequence: receipts.at(-1)?.sequence ?? 0, receipts, unresolved: receipts.filter(r => !r.erasedAt && !["completed", "rejected"].includes(r.stage)) };
     }
     if (!this.live.has(grant.grantId)) throw new RunnerChannelError("runner_hello_required", "Handshake required before receipts.");
+    if (body.type === "turn") return this.recordTurn(grant, body);
     if (typeof body.requestId !== "string" || !Number.isSafeInteger(body.sequence) || Number(body.sequence) < 1)
       throw new RunnerChannelError("invalid_runner_receipt", "Supply request ID and positive sequence.", 400);
     let stage: RunnerReceipt["stage"];
@@ -106,6 +109,45 @@ export class RunnerChannel {
       if (error instanceof OutboxHandlerError) throw new RunnerChannelError(error.code, error.message);
       throw error;
     }
+  }
+
+  /** Current authenticated invocation evidence, never a claim that absence means idle. */
+  currentTurn(nodeId: string): { runId: string; nativeTurnId: string; acceptedTurnIds: string[] } | null {
+    const grant = this.grants.activeForNode(nodeId);
+    if (!grant?.runId || this.grants.standing(grant.grantId) !== "current") return null;
+    const row = this.outbox.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_turn'
+      AND json_extract(payload,'$.runId')=? ORDER BY json_extract(payload,'$.sequence') DESC LIMIT 1`).get(nodeId, grant.runId) as { payload: string } | undefined;
+    if (!row) return null;
+    const report = JSON.parse(row.payload);
+    return report.state === "opened" ? { runId: grant.runId, nativeTurnId: report.nativeTurnId, acceptedTurnIds: report.acceptedTurnIds } : null;
+  }
+
+  private recordTurn(grant: ActivityGrant & { runId: string }, body: Record<string, unknown>): Record<string, unknown> {
+    const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.length <= 1024;
+    if (!Number.isSafeInteger(body.sequence) || Number(body.sequence) < 1 || !validId(body.nativeTurnId)
+      || !["opened", "closed"].includes(String(body.state)) || !Array.isArray(body.acceptedTurnIds)
+      || body.acceptedTurnIds.length > 10000 || !body.acceptedTurnIds.every(validId)
+      || new Set(body.acceptedTurnIds).size !== body.acceptedTurnIds.length)
+      throw new RunnerChannelError("invalid_runner_turn", "Supply epoch, state, positive family sequence and distinct accepted turn IDs.", 400);
+    const report = { type: "agent.runner_turn" as const, nodeId: grant.nodeId, runId: grant.runId, sequence: Number(body.sequence),
+      nativeTurnId: body.nativeTurnId, state: body.state as "opened" | "closed", acceptedTurnIds: body.acceptedTurnIds as string[] };
+    const rows = this.outbox.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_turn'
+      AND json_extract(payload,'$.runId')=? ORDER BY json_extract(payload,'$.sequence') DESC`).all(grant.nodeId, grant.runId) as { payload: string }[];
+    const prior = rows.map(row => JSON.parse(row.payload));
+    const duplicate = prior.find(row => row.sequence === report.sequence);
+    if (duplicate) {
+      if (JSON.stringify(duplicate) !== JSON.stringify(report)) throw new RunnerChannelError("runner_turn_conflict", "Turn sequence reused with different evidence.");
+      return { accepted: true };
+    }
+    if (prior[0] && report.sequence <= prior[0].sequence) throw new RunnerChannelError("runner_turn_stale", "Turn sequence regressed.");
+    // A closed epoch cannot reopen; later report updates to an open epoch may only add accepted IDs.
+    const same = prior.find(row => row.nativeTurnId === report.nativeTurnId);
+    if (!same && report.state === "closed") throw new RunnerChannelError("runner_turn_conflict", "Epoch was never opened.");
+    if (same && (same.state === "closed" || same.acceptedTurnIds.some((id: string) => !report.acceptedTurnIds.includes(id))))
+      throw new RunnerChannelError("runner_turn_conflict", "Epoch closed or accepted mapping regressed.");
+    if (prior[0]?.state === "opened" && prior[0].nativeTurnId !== report.nativeTurnId)
+      throw new RunnerChannelError("runner_turn_conflict", "Another native epoch remains open.");
+    this.events.emit(report); this.changed(); return { accepted: true };
   }
 
   /** The cursor never acknowledges an offer. Retained accepted/results are reconciled through hello/lookup. */
