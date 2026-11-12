@@ -163,7 +163,8 @@ export class RunnerChannel {
   /** Current authenticated invocation evidence, never a claim that absence means idle. */
   currentTurn(nodeId: string): { runId: string; nativeTurnId: string; acceptedTurnIds: string[] } | null {
     const grant = this.grants.activeForNode(nodeId);
-    if (!grant?.runId || this.grants.standing(grant.grantId) !== "current") return null;
+    if (!grant?.runId || this.grants.standing(grant.grantId) !== "current"
+      || this.outbox.runnerReceipts(nodeId, grant.runId).some(receipt => receipt.reconciliation)) return null;
     const row = this.outbox.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_turn'
       AND json_extract(payload,'$.runId')=? ORDER BY json_extract(payload,'$.sequence') DESC LIMIT 1`).get(nodeId, grant.runId) as { payload: string } | undefined;
     if (!row) return null;

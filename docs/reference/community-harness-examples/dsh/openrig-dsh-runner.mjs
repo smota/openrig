@@ -689,7 +689,7 @@ async function main() {
     if (cancellation?.target.nativeTurnId === nativeScope?.nativeTurnId && cancellation.submitted)
       finishCancel(stopReason === "cancelled" ? "cancelled" : "requested", stopReason === "cancelled" ? undefined : "native_end_without_cancellation_proof");
     if (entry && !entry.rejected) {
-      const completion = !entry.submitted ? "unknown" : stopReason === "cancelled" || state.cancelRequestedAt ? "interrupted"
+      const completion = !entry.submitted ? "unknown" : stopReason === "cancelled" ? "interrupted"
         : stopReason === "end_turn" && (entry.frame.kind !== "wake" || entry.answer.some(text => text.length > 0)) ? "completed"
           : stopReason === "error" ? "failed" : "unknown";
       report(entry, "result", { kind: entry.frame.kind, nativeTurnId: entry.nativeTurnId, completion,
