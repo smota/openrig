@@ -6,6 +6,7 @@
 // seat's opt-in (`--deny`) refuses every request. Each default permit leaves one pull-only record on the stream.
 
 import type Database from "better-sqlite3";
+import { ActivityGrantStore } from "./activity-grants.js";
 import { createHash } from "node:crypto";
 import { isHumanSeatSessionRef } from "./session-name.js";
 import { resolveRegisteredHumanAddress, type LoadResult } from "./gateway/human-registry.js";
@@ -412,8 +413,12 @@ export class RunnerPermissions {
   }
 
   withdrawTurn(seat: RunnerPermissionSeat, target: { runId: string; nativeTurnId: string }): { confirmed: boolean; withdrawn: number; pendingSubmissions: number } {
-    if (!target.runId || !target.nativeTurnId || this.deps.currentGeneration(seat.nodeId) !== seat.generation)
-      return { confirmed: false, withdrawn: 0, pendingSubmissions: 0 };
+    if (!target.runId || !target.nativeTurnId) return { confirmed: false, withdrawn: 0, pendingSubmissions: 0 };
+    if (this.deps.currentGeneration(seat.nodeId) !== seat.generation) {
+      const grants = new ActivityGrantStore(this.deps.db), active = grants.activeForNode(seat.nodeId);
+      if (!active || active.runId !== target.runId || active.generation !== seat.generation || grants.standing(active.grantId) !== "current")
+        return { confirmed: false, withdrawn: 0, pendingSubmissions: 0 };
+    }
     if (!this.turnFenced(seat.nodeId, target)) this.deps.eventBus.emit({ type: "agent.runner_turn_fenced", nodeId: seat.nodeId,
       generation: seat.generation, ...target });
     const rows = this.deps.db.prepare(`SELECT qitem_id FROM queue_items
@@ -452,6 +457,7 @@ export class RunnerPermissions {
     const now = this.read(seat, askId);
     if (!now.ok || !["pending", "withdrawn"].includes(now.state)) return now;
     const live = this.liveEnd(asked);
+    if (live && this.withdrawnAfterClose(live)) return { ok: true, state: "withdrawn" };
     // A handoff this host can't follow leaves its rows as they are; the runner just stops waiting. A row closed without a
     // decision (its answer kept, so the request read pending) can't be canceled: the withdrawal is recorded on it instead.
     if (live && (live.state === "pending" || live.state === "in-progress" || live.state === "blocked")) this.close(live, WITHDRAWN_NOTE, reason);

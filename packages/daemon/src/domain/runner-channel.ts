@@ -13,7 +13,7 @@ export function runnerChannelKind(binding: RunGrantBinding | null): "managed-pi"
 export class RunnerChannelError extends Error {
   constructor(readonly code: string, message: string, readonly status: 400 | 401 | 409 | 503 = 409) { super(message); }
 }
-interface Capabilities { input: boolean; wake: boolean; cancel: false }
+interface Capabilities { input: boolean; wake: boolean; cancel: boolean }
 
 /** Run-filtered wire coordination only. Retained authority and custody belong to the grant and outbox stores. */
 export class RunnerChannel {
@@ -38,7 +38,7 @@ export class RunnerChannel {
     return grant as ActivityGrant & { runId: string };
   }
 
-  capable(nodeId: string, kind: "input" | "wake"): boolean {
+  capable(nodeId: string, kind: "input" | "wake" | "cancel"): boolean {
     const grant = this.grants.activeForNode(nodeId);
     return !!grant?.runId && this.standing(grant.grantId) === "current" && (this.connections.get(grant.grantId) ?? 0) > 0 && this.live.get(grant.grantId)?.[kind] === true
       && !this.outbox.runnerReceipts(nodeId, grant.runId).some(receipt => receipt.reconciliation);
@@ -50,6 +50,43 @@ export class RunnerChannel {
       throw new RunnerChannelError("runner_unavailable", "No current capable native runner; input was not offered.");
     const receipt = this.outbox.admitRunner({ ...input, nodeId, runId: grant.runId });
     this.changed(); return receipt;
+  }
+
+  cancel(nodeId: string, input: { requestId: string; sender: string; destination: string; target: { runId: string; nativeTurnId: string } }): RunnerReceipt {
+    const { target } = input;
+    const admitted = { outboxId: input.requestId, senderSession: input.sender, destinationSession: input.destination,
+      body: `cancel ${target.runId} ${target.nativeTurnId}`, nodeId, runId: target.runId, kind: "cancel" as const,
+      inputRoute: "native" as const, payload: { target } };
+    const prior = this.outbox.runnerReceipt(input.requestId);
+    if (prior) return this.outbox.admitRunner(admitted);
+    const current = this.currentTurn(nodeId);
+    const matching = current?.runId === target.runId && current.nativeTurnId === target.nativeTurnId;
+    let receipt = this.outbox.admitRunner(admitted);
+    if (!matching || !this.capable(nodeId, "cancel")) {
+      receipt = this.outbox.updateRunner(nodeId, target.runId, input.requestId, receipt.sequence, "offered");
+      receipt = this.outbox.updateRunner(nodeId, target.runId, input.requestId, receipt.sequence, "accepted");
+      receipt = this.outbox.updateRunner(nodeId, target.runId, input.requestId, receipt.sequence, "completed",
+        { result: { kind: "cancel", outcome: matching ? "not-supported" : "not-this-turn", confirmed: false } });
+    }
+    this.changed(); return receipt;
+  }
+
+  prepareCancellation(token: string | undefined, body: Record<string, unknown>,
+    withdraw: (grant: ActivityGrant & { runId: string }, target: { runId: string; nativeTurnId: string }) => { confirmed: boolean; pendingSubmissions: number; withdrawn: number }): Record<string, unknown> {
+    const grant = this.authenticate(token), receipt = typeof body.requestId === "string" ? this.outbox.runnerReceipt(body.requestId) : null;
+    if (!receipt || receipt.kind !== "cancel" || receipt.runId !== grant.runId || body.runId !== grant.runId || receipt.nodeId !== grant.nodeId
+      || receipt.sequence !== body.sequence || receipt.stage !== "accepted" || receipt.erasedAt || receipt.reconciliation)
+      throw new RunnerChannelError("runner_request_mismatch", "Preparation requires this run's accepted cancellation receipt.");
+    const target = receipt.payload.target as { runId: string; nativeTurnId: string };
+    const current = this.currentTurn(grant.nodeId);
+    if (current?.runId !== target.runId || current.nativeTurnId !== target.nativeTurnId)
+      return { receipt, withdrawal: { confirmed: false, pendingSubmissions: 0, notThisTurn: true } };
+    if (receipt.withdrawal?.stage === "confirmed") return { receipt, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: receipt.withdrawal.withdrawn } };
+    // Retain the start before calling an owner that may withdraw some asks and then fail.
+    this.outbox.recordRunnerWithdrawal(grant.nodeId, grant.runId, receipt.requestId, receipt.sequence, { confirmed: false, pendingSubmissions: 0, withdrawn: receipt.withdrawal?.withdrawn ?? 0 });
+    const evidence = withdraw(grant, target);
+    const updated = this.outbox.recordRunnerWithdrawal(grant.nodeId, grant.runId, receipt.requestId, receipt.sequence, evidence);
+    this.changed(); return { receipt: updated, withdrawal: evidence };
   }
 
   post(token: string | undefined, raw: unknown): Record<string, unknown> {
@@ -66,7 +103,7 @@ export class RunnerChannel {
       // actual run authorize an optional operation; neither a wrapper nor hello establishes program qualification.
       const kind = runnerChannelKind(grant.binding);
       const supported = kind !== null && this.implementedKinds.has(kind);
-      const capabilities: Capabilities = { input: supported && declared.input === true, wake: supported && declared.wake === true, cancel: false };
+      const capabilities: Capabilities = { input: supported && declared.input === true, wake: supported && declared.wake === true, cancel: supported && declared.cancel === true };
       if (!body.retained) this.outbox.forgetRunnerMap(grant.nodeId, grant.runId);
       this.live.set(grant.grantId, capabilities);
       const receipts = this.outbox.runnerReceipts(grant.nodeId, grant.runId);
@@ -84,6 +121,9 @@ export class RunnerChannel {
     else if (body.type === "result") stage = "completed";
     else if (body.type === "rejected") stage = "rejected";
     else throw new RunnerChannelError("invalid_runner_receipt", "Unknown channel receipt type.", 400);
+    const pending = this.outbox.runnerReceipt(body.requestId);
+    if (pending?.kind === "cancel" && stage === "submitted" && (pending.withdrawal?.stage !== "confirmed" || body.result === undefined))
+      throw new RunnerChannelError("runner_withdrawal_unconfirmed", "Native cancellation submission requires confirmed permission withdrawal.");
     const evidence: Pick<RunnerReceipt, "acceptedTurnId" | "nativeTurnId" | "result"> = {};
     for (const key of ["acceptedTurnId", "nativeTurnId"] as const) {
       if (body[key] !== undefined) {
@@ -91,10 +131,14 @@ export class RunnerChannel {
         evidence[key] = body[key];
       }
     }
-    if (stage === "completed" || stage === "rejected") {
+    if (stage === "completed" || stage === "rejected" || stage === "submitted" && body.result !== undefined) {
       if (!body.result || typeof body.result !== "object" || Array.isArray(body.result)) throw new RunnerChannelError("invalid_runner_result", "Supply a native result.", 400);
       const receipt = this.outbox.runnerReceipt(body.requestId);
       const result = body.result as Record<string, unknown>;
+      if (receipt?.kind === "cancel" && (result.kind !== "cancel" || !["requested", "cancelled", "not-this-turn", "not-supported"].includes(String(result.outcome))
+        || typeof result.confirmed !== "boolean" || stage === "submitted" && result.outcome !== "requested"
+        || result.confirmed !== (result.outcome === "cancelled") || result.operationAccepted !== undefined && typeof result.operationAccepted !== "boolean")) throw new RunnerChannelError("invalid_runner_result", "Invalid cancellation outcome.", 400);
+      if (receipt?.kind !== "cancel" && result.kind === "cancel") throw new RunnerChannelError("invalid_runner_result", "Cancellation result belongs to another operation.", 400);
       if (result.ownershipUnknown !== undefined && (result.ownershipUnknown !== true || receipt?.kind !== "wake" || stage !== "completed"
         || result.kind !== "wake" || result.completion !== "unknown" || result.answer !== null))
         throw new RunnerChannelError("invalid_runner_result", "Unknown native ownership requires an unknown wake with no answer.", 400);
@@ -164,6 +208,8 @@ export class RunnerChannel {
       throw new RunnerChannelError("invalid_runner_cursor", "Invalid run-local cursor.", 400);
     // Once custody is unknown, never automatically feed later saved prompts into that execution.
     if (receipts.some(receipt => receipt.reconciliation)) return [];
+    const control = receipts.find(r => r.kind === "cancel" && ["pending", "offered"].includes(r.stage) && !r.erasedAt);
+    if (control) return [control.stage === "offered" ? control : this.outbox.updateRunner(grant.nodeId, grant.runId, control.requestId, control.sequence, "offered")];
     const offered = receipts.find(r => r.stage === "offered" && !r.reconciliation && !r.erasedAt);
     if (offered) return [offered];
     const pending = receipts.find(r => r.stage === "pending" && !r.reconciliation && !r.erasedAt);
