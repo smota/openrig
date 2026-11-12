@@ -375,7 +375,7 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
       writeFileSync(join(agent, "models.json"), JSON.stringify({ providers: { local: { baseUrl: program.providerUrl, api: "anthropic-messages", apiKey: "offline-dummy", models: [{ id: "fixture-model", name: "Offline fixture", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
     }
     let current = await fixture(true, kind, kind === "pi" ? 0 : 1, file);
-    let fault: { type: string; commit: boolean; hits: number; requestId?: string } | null = null;
+    let fault: { type: string; commit: boolean; hits: number; requestId?: string; status?: number } | null = null;
     let lookupDelay = 0;
     let hellos = 0;
     const server = serve({ hostname: "127.0.0.1", port: 0, fetch: async request => {
@@ -383,10 +383,10 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
       if (body?.type === "hello") hellos += 1;
       const active = fault && body?.type === fault.type && (!fault.requestId || fault.requestId === body.requestId) ? fault : null;
       if (active) active.hits += 1;
-      if (active && !active.commit) return new Response(null, { status: 503 });
+      if (active && !active.commit) return new Response(null, { status: active.status ?? 503 });
       const response = await current.app.fetch(request);
       if (lookupDelay && request.method === "GET" && new URL(request.url).pathname.startsWith("/api/seat/command/")) await sleep(lookupDelay);
-      return active ? new Response(null, { status: 503 }) : response;
+      return active ? new Response(null, { status: active.status ?? 503 }) : response;
     } });
     await new Promise<void>(done => server.once("listening", done));
     cleanups.push(() => { server.closeAllConnections(); server.close(); });
@@ -436,6 +436,18 @@ active=reply;timer=setTimeout(()=>{active=null;reply({stopReason:text==='INTERRU
     expect(h.f.outbox.runnerReceipt("late-E")?.result?.outcome).toBe("not-this-turn");
     expect(cancelWrites()).toHaveLength(1);
     expect(await waitFor(() => h.f.outbox.runnerReceipt("work-F")?.result?.completion === "completed"), h.output).toBe(true);
+  });
+  it.each(["pi", "dsh"] as const)("%s permanent cancel acknowledgement refusal never withdraws or aborts and does not strand person F", async kind => {
+    const h = await nativeProcess(kind), child = h.start(); await h.ready(); child.stdin!.write("SLOW PERSON E\n");
+    const target = await waitFor(() => h.f.channel.currentTurn(h.f.node.id)); expect(target).toBeTruthy();
+    h.fault = { type: "ack", requestId: "refused-cancel", status: 409, commit: false, hits: 0 };
+    expect((await h.f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "cancel", requestId: "refused-cancel", target: { runId: target!.runId, nativeTurnId: target!.nativeTurnId } }) })).status).toBe(202);
+    expect(await waitFor(() => h.fault!.hits > 0)).toBe(true); child.stdin!.write("PERSON F\n");
+    expect(await waitFor(() => h.prompts().includes("PERSON F")), h.output).toBe(true);
+    expect(h.entries().filter(entry => kind === "pi" ? entry.type === "abort" : entry.method === "session/cancel")).toEqual([]);
+    expect(h.f.outbox.runnerReceipt("refused-cancel")?.withdrawal).toBeUndefined();
+    expect(h.f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_turn_fenced'").get()).toEqual({ n: 0 });
   });
   it.each(["pi", "dsh"] as const)("%s reconnect retains lower unacked N after control N+1 overtakes it", async kind => {
     const h = await nativeProcess(kind); h.start(); await h.ready();
