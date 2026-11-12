@@ -299,6 +299,7 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
     let fault: { type: string; commit: boolean; hits: number } | null = null;
     let lookupDelay = 0;
     let hellos = 0;
+    const channelResponses: Array<{ type: string; status: number; code?: string }> = [];
     const server = serve({ hostname: "127.0.0.1", port: 0, fetch: async request => {
       const body = request.method === "POST" && new URL(request.url).pathname === "/api/activity/runner-channel" ? await request.clone().json() as { type: string } : null;
       if (body?.type === "hello") hellos += 1;
@@ -306,6 +307,10 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
       if (active) active.hits += 1;
       if (active && !active.commit) return new Response(null, { status: 503 });
       const response = await current.app.fetch(request);
+      if (observations && body) {
+        const payload = await response.clone().json() as { code?: string };
+        channelResponses.push({ type: body.type, status: response.status, code: payload.code });
+      }
       if (lookupDelay && request.method === "GET" && new URL(request.url).pathname.startsWith("/api/seat/command/")) await sleep(lookupDelay);
       return active ? new Response(null, { status: 503 }) : response;
     } });
@@ -333,7 +338,7 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
     const entries = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
     const prompts = () => entries().filter(entry => kind === "pi" ? entry.type === "prompt" : entry.method === "session/prompt")
       .map(entry => kind === "pi" ? entry.message : ((entry.params as { prompt: Array<{ text: string }> }).prompt.map(p => p.text).join("")));
-    return { start, ready, reopen, url, server, prompts, entries, dir, get output() { return output; }, get f() { return current; }, get hellos() { return hellos; },
+    return { start, ready, reopen, url, server, prompts, entries, dir, channelResponses, get output() { return output; }, get f() { return current; }, get hellos() { return hellos; },
       get fault() { return fault; }, set fault(value) { fault = value; }, set lookupDelay(value: number) { lookupDelay = value; } };
   }
 
@@ -408,6 +413,8 @@ setTimeout(()=>reply({stopReason:text==='INTERRUPT'?'cancelled':'end_turn'}),tex
     h.f.db.prepare("DELETE FROM seat_identity_verdicts WHERE node_id=?").run(h.f.node.id);
     h.fault = null; const hellos = h.hellos; h.server.closeAllConnections();
     expect(await waitFor(() => h.hellos > hellos), h.output).toBe(true);
+    expect(await waitFor(() => h.channelResponses.some(response => response.type === "result"
+      && response.status === 409 && response.code === "runner_grant_unverified")), h.output).toBe(true);
     const report = { runId: h.f.grant.runId, sequence: 2, occurredAt: new Date().toISOString(),
       observations: { model: { id: "after-verification" }, context: { usedTokens: 1, windowTokens: 10 } } };
     expect(await post(report)).toMatchObject({ status: 409, body: { code: "activity_grant_unverified", retryable: true } });
