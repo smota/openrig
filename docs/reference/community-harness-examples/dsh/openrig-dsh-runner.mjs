@@ -28,7 +28,7 @@ const POST_TIMEOUT_MS = 2_000;
 const WAIT_SECONDS = 25;
 const READ_TRIES = 3; // reads in a row that get no answer before the runner permits
 // Refusals that say the request certainly isn't the seat's current occupant's live one: cancel it, and hold nothing.
-const NOT_LIVE = ["stale_generation", "activity_grant_wrong_seat", "activity_grant_stale"];
+const NOT_LIVE = ["stale_generation", "activity_grant_wrong_seat", "activity_grant_stale", "turn_withdrawn", "runner_turn_unbound"];
 // A read's states that end the request, answered cancelled (an `answered` that reaches there names an option dsh didn't
 // offer). Any other state, like an unlisted status, permits.
 const ENDED = ["refused", "withdrawn", "stale", "answered"];
@@ -97,12 +97,15 @@ function escapeLength(rest) {
 }
 
 /** JSON-RPC 2.0 with the agent, one message per line on its stdio. */
-class AgentPeer {
+export class AgentPeer {
   #child;
   #next = 1;
   #waiting = new Map();
   #requests = new Map();
   #notifications = new Map();
+  #prompt = null;
+  #promptEpoch = 0;
+  #cancellationFence = null;
 
   constructor(child, onNoise) {
     this.#child = child;
@@ -114,6 +117,7 @@ class AgentPeer {
         const waiter = this.#waiting.get(message.id);
         if (!waiter) return;
         this.#waiting.delete(message.id);
+        if (this.#prompt?.requestId === message.id) this.#prompt = null;
         if (message.error) waiter.reject(Object.assign(new Error(message.error.message ?? "error"), { code: message.error.code }));
         else waiter.resolve(message.result);
         return;
@@ -121,15 +125,42 @@ class AgentPeer {
       if (message.id === undefined) { this.#notifications.get(message.method)?.(message.params ?? {}); return; }
       const handler = this.#requests.get(message.method);
       if (!handler) { this.#write({ id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } }); return; }
+      const epoch = this.#prompt?.nativeTurnId;
       Promise.resolve().then(() => handler(message.params ?? {}, message.id)).then(
-        (result) => this.#write({ id: message.id, result }),
+        (result) => this.#write({ id: message.id, result: message.method === "session/request_permission"
+          && (!epoch || this.#prompt?.nativeTurnId !== epoch || this.#cancellationFence === epoch) ? CANCELLED : result }),
         (error) => this.#write({ id: message.id, error: { code: error.code ?? -32603, message: error.message } }));
     });
   }
 
-  request(method, params) {
+  request(method, params, onPrompt) {
+    if (method === "session/prompt" && (this.#prompt || this.#cancellationFence)) throw new Error("Native prompt ownership is fenced");
     const id = this.#next++;
-    return new Promise((resolve, reject) => { this.#waiting.set(id, { resolve, reject }); this.#write({ id, method, params }); });
+    if (method === "session/prompt") this.#prompt = { nativeTurnId: `dsh-prompt-${++this.#promptEpoch}`, requestId: id, sessionId: params.sessionId, submitted: false };
+    return new Promise((resolve, reject) => {
+      this.#waiting.set(id, { resolve, reject });
+      const write = () => {
+        if (this.#prompt?.requestId === id) this.#prompt.submitted = true;
+        this.#write({ id, method, params });
+      };
+      if (!onPrompt) { write(); return; }
+      Promise.resolve().then(() => onPrompt(this.promptScope())).then(write, error => {
+        this.#waiting.delete(id); if (this.#prompt?.requestId === id) this.#prompt = null; reject(error);
+      });
+    });
+  }
+
+  promptScope() { return this.#prompt ? { ...this.#prompt } : null; }
+  isCancellationFenced() { return this.#cancellationFence !== null; }
+  prepareCancellation(nativeTurnId) {
+    if (!this.#prompt?.submitted || this.#prompt.nativeTurnId !== nativeTurnId) return false;
+    this.#cancellationFence = nativeTurnId; return true;
+  }
+  // Preparation recheck releases only a target that ended before any managed cancel submission.
+  recheckCancellation(nativeTurnId) {
+    if (this.#cancellationFence !== nativeTurnId) return false;
+    if (this.#prompt?.nativeTurnId === nativeTurnId) return true;
+    this.#cancellationFence = null; return false;
   }
 
   notify(method, params) { this.#write({ method, params }); }
@@ -139,6 +170,7 @@ class AgentPeer {
   failAll(reason) {
     for (const waiter of this.#waiting.values()) waiter.reject(new Error(reason));
     this.#waiting.clear();
+    this.#prompt = null;
   }
 
   #write(message) {
@@ -277,6 +309,15 @@ async function main() {
   const managed = new Map();
   const channelStop = new AbortController();
   let activeManaged = null;
+  let nativeTurnSequence = 0;
+  let nativeTurnPosts = Promise.resolve();
+  const reportTurn = (scope, status, acceptedTurnId) => {
+    if (!scope || !env.OPENRIG_RUN_ID || !env.OPENRIG_ACTIVITY_HOOK_TOKEN) return Promise.resolve();
+    const body = { type: "turn", runId: env.OPENRIG_RUN_ID, sequence: ++nativeTurnSequence,
+      nativeTurnId: scope.nativeTurnId, state: status, acceptedTurnIds: [acceptedTurnId] };
+    nativeTurnPosts = nativeTurnPosts.then(() => channelPost(body));
+    return nativeTurnPosts;
+  };
   const channelPost = async (body) => {
     while (!channelStop.signal.aborted) {
       const result = await callOpenRig("POST", "/api/activity/runner-channel", body, POST_TIMEOUT_MS);
@@ -290,7 +331,7 @@ async function main() {
     const f = entry.frame;
     if (result) entry.result = result;
     entry.reports = entry.reports.then(() => channelPost({ type, runId: f.runId, requestId: f.requestId, sequence: f.sequence,
-      ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}), ...(result ? { result } : {}) }));
+      ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId, acceptedTurnId: entry.acceptedTurnId } : {}), ...(result ? { result } : {}) }));
   };
   const submitted = (entry) => {
     if (!entry || entry.submitted) return;
@@ -429,10 +470,11 @@ async function main() {
   // request OpenRig says isn't the current occupant's, or that a person said no to with no reject option, is cancelled.
   const askOwner = async (requestId, toolCall, options) => {
     const turn = state.turn;
-    const live = () => state.running && state.turn === turn && !state.cancelRequestedAt && !agentExited;
+    const live = () => state.running && state.turn === turn && !state.cancelRequestedAt && !peer.isCancellationFenced() && !agentExited;
     const submitted = await callOpenRig("POST", "/api/activity/permission-requests", {
       sessionName: env.OPENRIG_SESSION_NAME, nodeId: env.OPENRIG_NODE_ID, generation: env.OPENRIG_OCCUPANT_GENERATION,
-      nativeRef: state.sessionId, turnId: String(turn), requestId: String(requestId), toolCall,
+      nativeRef: state.sessionId, turnId: String(turn),
+      ...(env.OPENRIG_RUN_ID && peer.promptScope() ? { runId: env.OPENRIG_RUN_ID, nativeTurnId: peer.promptScope().nativeTurnId } : {}), requestId: String(requestId), toolCall,
       options: options.map((option) => ({ optionId: option.optionId, name: option.name ?? option.optionId, kind: option.kind })),
       occurredAt: new Date().toISOString(),
     }, 10_000);
@@ -533,7 +575,7 @@ async function main() {
     const toolCall = { title: String(params.toolCall?.title ?? "a tool call"), kind: String(params.toolCall?.kind ?? "other") };
     const options = Array.isArray(params.options) ? params.options : [];
     say(`\n[permission] dsh asks: ${toolCall.title} (${toolCall.kind}); options ${options.map((option) => option.optionId).join(", ")}`);
-    if (!state.running || state.cancelRequestedAt) return CANCELLED;
+    if (!state.running || state.cancelRequestedAt || peer.isCancellationFenced()) return CANCELLED;
     state.asking += 1; // no beat while a permission request is open: it may be waiting on a person
     return askOwner(requestId, toolCall, options).finally(() => { state.asking -= 1; setImmediate(settle); });
   });
@@ -570,12 +612,17 @@ async function main() {
     state.cancelRequestedAt = null;
     state.lastActive = 0;
     const turnId = String(state.turn);
-    if (entry) { entry.state = "writing"; entry.nativeTurnId = `dsh-prompt-${state.turn}`; }
+    if (entry) entry.state = "writing";
+    let nativeScope;
     say(`\nyou ▸ ${firstLine(text)}`);
     activity.post("UserPromptSubmit", "accepted", { turnId });
     let stopReason;
     try {
-      const result = await peer.request("session/prompt", { sessionId: state.sessionId, prompt: [{ type: "text", text }] });
+      const result = await peer.request("session/prompt", { sessionId: state.sessionId, prompt: [{ type: "text", text }] }, async scope => {
+        nativeScope = scope;
+        if (entry) { entry.nativeTurnId = scope.nativeTurnId; entry.acceptedTurnId = turnId; }
+        await reportTurn(scope, "opened", turnId);
+      });
       if (entry) submitted(entry);
       stopReason = String(result?.stopReason ?? "unreported");
     } catch (error) {
@@ -587,6 +634,7 @@ async function main() {
       activity.post("Notification", "runtime_error", { turnId });
       stopReason = "error";
     }
+    await reportTurn(nativeScope, "closed", turnId);
     if (entry && !entry.rejected) {
       const completion = !entry.submitted ? "unknown" : stopReason === "cancelled" || state.cancelRequestedAt ? "interrupted"
         : stopReason === "end_turn" && (entry.frame.kind !== "wake" || entry.answer.some(text => text.length > 0)) ? "completed"
@@ -606,7 +654,7 @@ async function main() {
   };
 
   const pump = () => {
-    if (state.running || agentExited || state.queue.length === 0) return;
+    if (state.running || peer.isCancellationFenced() || agentExited || state.queue.length === 0) return;
     const next = state.queue[0];
     if (typeof next !== "string" && [...managed.values()].some(prior => prior.state === "accepting" && prior.frame.sequence < next.frame.sequence)) return;
     void runTurn(state.queue.shift());
