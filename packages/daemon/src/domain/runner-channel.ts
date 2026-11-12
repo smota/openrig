@@ -99,7 +99,14 @@ export class RunnerChannel {
       const kind = runnerChannelKind(grant.binding);
       const supported = kind !== null && this.implementedKinds.has(kind);
       const capabilities: Capabilities = { input: supported && declared.input === true, wake: supported && declared.wake === true, cancel: supported && declared.cancel === true };
-      if (!body.retained) this.outbox.forgetRunnerMap(grant.nodeId, grant.runId);
+      if (!body.retained) {
+        this.outbox.forgetRunnerMap(grant.nodeId, grant.runId);
+        // Person turns and completed input may have no unresolved receipt. A not-retained report invalidates prior
+        // epoch evidence; a fresh run's first empty hello, or a temporary SSE disconnect, has no such meaning.
+        if (!this.runnerMapLost(grant.nodeId, grant.runId) && this.outbox.db.prepare(`SELECT 1 FROM events
+          WHERE node_id=? AND type='agent.runner_turn' AND json_extract(payload,'$.runId')=? LIMIT 1`).get(grant.nodeId, grant.runId))
+          this.events.emit({ type: "agent.runner_map_lost", nodeId: grant.nodeId, runId: grant.runId });
+      }
       this.live.set(grant.grantId, capabilities);
       const receipts = this.outbox.runnerReceipts(grant.nodeId, grant.runId);
       this.changed();
@@ -159,12 +166,18 @@ export class RunnerChannel {
   currentTurn(nodeId: string): { runId: string; nativeTurnId: string; acceptedTurnIds: string[] } | null {
     const grant = this.grants.activeForNode(nodeId);
     if (!grant?.runId || this.grants.standing(grant.grantId) !== "current"
+      || this.runnerMapLost(nodeId, grant.runId)
       || this.outbox.runnerReceipts(nodeId, grant.runId).some(receipt => receipt.reconciliation)) return null;
     const row = this.outbox.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_turn'
       AND json_extract(payload,'$.runId')=? ORDER BY json_extract(payload,'$.sequence') DESC LIMIT 1`).get(nodeId, grant.runId) as { payload: string } | undefined;
     if (!row) return null;
     const report = JSON.parse(row.payload);
     return report.state === "opened" ? { runId: grant.runId, nativeTurnId: report.nativeTurnId, acceptedTurnIds: report.acceptedTurnIds } : null;
+  }
+
+  private runnerMapLost(nodeId: string, runId: string): boolean {
+    return !!this.outbox.db.prepare(`SELECT 1 FROM events WHERE node_id=? AND type='agent.runner_map_lost'
+      AND json_extract(payload,'$.runId')=? LIMIT 1`).get(nodeId, runId);
   }
 
   private recordTurn(grant: ActivityGrant & { runId: string }, body: Record<string, unknown>): Record<string, unknown> {

@@ -301,6 +301,52 @@ describe("run-bound native channel custody", () => {
     expect(f.outbox.runnerReceipt(ordinary.requestId)?.stage).toBe("pending");
     expect((await f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, target: { ...request.target, nativeTurnId: "F" } }) })).status).toBe(409);
   });
+  it.each([false, true])("explicit receiver map loss invalidates E durably with only completed receipts=%s", async completedReceipt => {
+    const dir = mkdtempSync(join(tmpdir(), "native-empty-map-")), file = join(dir, "core.sqlite");
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const f = await fixture(true, "pi", 0, file);
+    const turn = { type: "turn", runId: "run-one", sequence: 1, nativeTurnId: "person-E", state: "opened", acceptedTurnIds: ["1"] };
+    expect(() => f.channel.post(f.grant.token, turn)).toThrow(/Handshake required/);
+    f.channel.post(f.grant.token, { ...f.hello, retained: false });
+    expect(f.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_map_lost'").get()).toEqual({ n: 0 });
+    f.channel.post(f.grant.token, turn);
+    expect(f.channel.currentTurn(f.node.id)?.nativeTurnId).toBe("person-E");
+    f.channel.post(f.grant.token, f.hello);
+    const disconnect = f.channel.connect(f.grant.token);
+    f.channel.post(f.grant.token, { ...turn, sequence: 2 });
+    expect(f.channel.currentTurn(f.node.id)?.nativeTurnId).toBe("person-E");
+    if (completedReceipt) {
+      const input = f.admit("completed-input"); f.channel.frames(f.grant.token, 0);
+      const body = { runId: "run-one", requestId: input.requestId, sequence: input.sequence };
+      f.channel.post(f.grant.token, { ...body, type: "ack", state: "accepted" });
+      f.channel.post(f.grant.token, { ...body, type: "submitted", acceptedTurnId: "1", nativeTurnId: "person-E" });
+      f.channel.post(f.grant.token, { ...body, type: "result", result: { kind: "input", accepted: true } });
+    }
+    const receipts = f.outbox.runnerReceipts(f.node.id, "run-one");
+    expect(receipts).toHaveLength(completedReceipt ? 1 : 0);
+    if (completedReceipt) expect(receipts[0]?.stage).toBe("completed");
+    disconnect(); expect(f.channel.currentTurn(f.node.id)?.nativeTurnId).toBe("person-E");
+    f.channel.post(f.grant.token, { ...f.hello, retained: false });
+    expect(f.channel.currentTurn(f.node.id)).toBeNull();
+    expect(f.outbox.runnerReceipts(f.node.id, "run-one")).toEqual(receipts);
+    // A late same-run report/retained hello cannot reconstruct a map the receiver says it lost.
+    f.channel.post(f.grant.token, f.hello); f.channel.post(f.grant.token, { ...turn, sequence: 3 });
+    expect(f.channel.currentTurn(f.node.id)).toBeNull();
+    f.db.close();
+    const reopened = await fixture(true, "pi", 0, file, { node: f.node, grant: f.grant });
+    expect(reopened.channel.currentTurn(f.node.id)).toBeNull();
+    reopened.channel.post(f.grant.token, { ...f.hello, retained: false });
+    expect(reopened.channel.currentTurn(f.node.id)).toBeNull();
+    expect(reopened.outbox.runnerReceipts(f.node.id, "run-one")).toEqual(receipts);
+    expect(reopened.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_map_lost'").get()).toEqual({ n: 1 });
+    const next = reopened.grants.issue({ nodeId: f.node.id, generation: f.grant.generation, issuedBy: "replacement",
+      run: { runId: "run-two", binding: f.grant.binding! } });
+    expect(reopened.grants.activate(next.grantId)).toBe(true);
+    reopened.channel.post(next.token, { ...f.hello, runId: "run-two", retained: false });
+    reopened.channel.post(next.token, { ...turn, runId: "run-two", nativeTurnId: "F" });
+    expect(reopened.channel.currentTurn(f.node.id)).toMatchObject({ runId: "run-two", nativeTurnId: "F" });
+    const close = reopened.channel.connect(next.token); expect(reopened.channel.capable(f.node.id, "cancel")).toBe(true); close();
+  });
   it("keeps retained E and permission binding during SSE disconnect without pretending unknown is idle", async () => {
     const f = await fixture(); f.channel.post(f.grant.token, f.hello);
     const disconnect = f.channel.connect(f.grant.token);

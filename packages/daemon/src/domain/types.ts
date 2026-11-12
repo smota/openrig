@@ -216,6 +216,7 @@ export type RigEvent =
   | { type: "agent.runner_turn"; nodeId: string; runId: string; sequence: number; nativeTurnId: string;
       state: "opened" | "closed"; acceptedTurnIds: string[] }
   | { type: "agent.runner_turn_fenced"; nodeId: string; generation: string; runId: string; nativeTurnId: string }
+  | { type: "agent.runner_map_lost"; nodeId: string; runId: string }
   | { type: "agent.session_identity"; rigId: string; nodeId: string; sessionName: string; runtime: string; sessionId: string; provenance: "hook" | "scrape" | "rpc" }
   // OPR.0.4.0.22 — append-only audit of a managed resume-token write. Emitted
   // on an operator set (`operator_set`) and on reconcile capture-on-adopt
