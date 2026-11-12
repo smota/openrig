@@ -546,7 +546,7 @@ export class RunnerCore {
   }
   /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
   isReady(): boolean { return this.ready; }
-  nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined && this.runtime === "pi", wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: this.ready && !this.managedQuarantined && this.runtime === "pi" && !!this.io.withdrawNativeTurn }; }
+  nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined, wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: this.ready && !this.managedQuarantined && this.runtime === "pi" && !!this.io.withdrawNativeTurn }; }
 
   /** Install the local preparation fence; this method alone submits no native operation. */
   prepareNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
@@ -662,7 +662,7 @@ export class RunnerCore {
   private get runtime(): string { return this.opts.runtime ?? "pi"; }
 
   async acceptRunnerRequest(frame: PiManagedRequest): Promise<void> {
-    if (!this.ready || this.runtime !== "pi" || !this.io.postRunner || frame.version !== 1 || frame.runId !== this.identity.runId
+    if (!this.ready || this.runtime !== "pi" && frame.kind !== "input" || !this.io.postRunner || frame.version !== 1 || frame.runId !== this.identity.runId
       || !Number.isSafeInteger(frame.sequence) || frame.sequence < 1 || typeof frame.requestId !== "string"
       || !["input", "wake", "cancel"].includes(frame.kind)
       || (frame.kind === "cancel" ? !frame.payload?.target || frame.payload.target.runId !== frame.runId || typeof frame.payload.target.nativeTurnId !== "string"
@@ -754,7 +754,7 @@ export class RunnerCore {
   }
 
   private pumpManaged(): void {
-    if (!this.ready || this.cancellationFence || this.managedQuarantined || this.managedWake || this.pendingManagedStart && !this.streaming) return;
+    if (!this.ready || this.cancellationFence || this.managedQuarantined || this.managedWake || this.runtime === "pi" && this.pendingManagedStart && !this.streaming) return;
     const entry = this.managedQueue[0];
     if (!entry || this.personPreflights.size || [...this.managed.values()].some(prior => prior.state === "accepting" && prior.frame.sequence < entry.frame.sequence)
       || entry.frame.kind === "wake" && (this.streaming || this.pendingManagedStart)) return;
@@ -768,14 +768,16 @@ export class RunnerCore {
     this.promptRevision += 1;
     this.managedQueue.shift(); entry.state = "writing";
     if (entry.frame.kind === "wake") { this.managedWake = entry; entry.answer = []; }
-    if (!this.streaming) this.pendingManagedStart = true;
+    if (this.runtime === "pi" && !this.streaming) this.pendingManagedStart = true;
     const id = `openrig-native-${entry.frame.requestId}`;
     this.managedRpc.set(id, entry);
-    if (this.streaming && entry.frame.kind === "input") this.epochSteers.add(entry.frame.payload.text!);
+    if (this.runtime === "pi" && this.streaming && entry.frame.kind === "input") this.epochSteers.add(entry.frame.payload.text!);
     this.io.sendRpc({ id, type: "prompt", message: entry.frame.kind === "wake" ? entry.frame.payload.question! : entry.frame.payload.text!, streamingBehavior: "steer" });
     this.acceptIntoOpenRun();
-    if (this.nativeTurn) { entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn); }
-    else this.pendingNativeInputs.add(entry);
+    if (this.runtime === "pi") {
+      if (this.nativeTurn) { entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn); }
+      else this.pendingNativeInputs.add(entry);
+    }
     // Ordinary busy messages may steer; the next queued wake waits for agent_end, not this RPC response.
     this.pumpManaged();
   }
@@ -923,6 +925,9 @@ export class RunnerCore {
           if (managed.nativeTerminal || managed.disposition !== "started" && !this.streaming) this.finishManagedWake(managed);
           else if (managed.terminalResult) this.reportManaged(managed, "result", managed.terminalResult);
           if (this.managedWake !== managed && !this.streaming) { this.pendingManagedStart = false; this.pumpManaged(); }
+        } else if (this.runtime !== "pi") {
+          // Input acceptance needs the correlated RPC response, not an invented native invocation.
+          managed.state = "terminal"; this.reportManaged(managed, "result", { kind: "input", accepted: true });
         } else {
           managed.disposition = inputData?.agentInvoked === false ? "handled" : typeof inputData?.disposition === "string" ? inputData.disposition : "unknown";
           if (managed.disposition === "handled") {
@@ -1892,8 +1897,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   child.once("exit", () => { nativeStream.abort(); setTimeout(() => nativePosts.abort(), 2000).unref(); });
   child.once("error", () => { nativeStream.abort(); nativePosts.abort(); });
   const io: RunnerIo = {
-    ...(runtime === "pi" && endpoint && process.env.OPENRIG_RUN_ID ? { postRunner: (body: Record<string, unknown>) => postPiRunnerChannel(endpoint, body, nativePosts.signal),
-      withdrawNativeTurn: async (body: Record<string, unknown>) => {
+    ...(endpoint && process.env.OPENRIG_RUN_ID ? { postRunner: (body: Record<string, unknown>) => postPiRunnerChannel(endpoint, body, nativePosts.signal) } : {}),
+    ...(runtime === "pi" && endpoint && process.env.OPENRIG_RUN_ID ? { withdrawNativeTurn: async (body: Record<string, unknown>) => {
         try {
           const response = await fetch(`${endpoint.baseUrl}/api/activity/runner-channel`, { method: "POST", signal: AbortSignal.timeout(3000),
             headers: { authorization: `Bearer ${endpoint.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -1964,7 +1969,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }, { catchUpSince, runtime, usageFacts: args.usageFacts === true, openRouterCharge: args.openRouterCharge === true, launchCredentialEvidence,
     requestedSessionFile: args.sessionFile });
 
-  if (runtime === "pi" && endpoint && process.env.OPENRIG_RUN_ID)
+  if (endpoint && process.env.OPENRIG_RUN_ID)
     void connectPiRunnerChannel(core, endpoint, process.env.OPENRIG_RUN_ID, nativeStream.signal);
 
   let transportUp = runtime !== "omp";
