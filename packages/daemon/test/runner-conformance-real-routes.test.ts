@@ -259,6 +259,21 @@ describe("run-bound native channel custody", () => {
       kind: "input", inputRoute: "native", payload: { text: id } });
     return { db, node, grant, grants, outbox, channel, hello, admit, app, guard, transport };
   }
+  it("retains authenticated native epoch evidence with family-local sequence and replay conflict checks", async () => {
+    const f = await fixture(); f.channel.post(f.grant.token, f.hello);
+    const report = { type: "turn", runId: f.grant.runId, sequence: 1, nativeTurnId: "epoch-E", state: "opened", acceptedTurnIds: ["1", "2"] };
+    expect(() => f.channel.post(f.grant.token, { ...report, state: "closed" })).toThrow();
+    expect(f.channel.post(f.grant.token, report)).toMatchObject({ accepted: true });
+    expect(f.channel.post(f.grant.token, report)).toMatchObject({ accepted: true });
+    expect(() => f.channel.post(f.grant.token, { ...report, acceptedTurnIds: ["3"] })).toThrow();
+    expect(f.channel.currentTurn(f.node.id)).toMatchObject({ runId: f.grant.runId, nativeTurnId: "epoch-E", acceptedTurnIds: ["1", "2"] });
+    f.channel.post(f.grant.token, { ...report, sequence: 2, state: "closed" });
+    expect(f.channel.currentTurn(f.node.id)).toBeNull();
+    expect(f.db.prepare("SELECT count(*) AS n FROM events WHERE type='agent.runner_turn'").get()).toEqual({ n: 2 });
+    f.grants.revoke({ grantId: f.grant.grantId }, "test");
+    expect(() => f.channel.post(f.grant.token, { ...report, sequence: 3 })).toThrow();
+    expect(f.channel.currentTurn(f.node.id)).toBeNull();
+  });
   async function nativeProcess(kind: "pi" | "dsh", program?: { bin: string; providerUrl: string }) {
     const dir = mkdtempSync(join(tmpdir(), `native-recovery-${kind}-`)), file = join(dir, "core.sqlite"), log = join(dir, "native.log");
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

@@ -1415,6 +1415,38 @@ describe("managed Pi input and attributed wake", () => {
     const response = (id: string, success = true) => event("response", { id: `openrig-native-${id}`, command: "prompt", success, data: { disposition: "started" } });
     return { ...f, posts, core, frame, event, response };
   }
+  it("reports one native invocation for two steers and inner model turns", async () => {
+    const f = managed(); f.core.handleUserBlock("start"); f.event("agent_start");
+    f.core.handleUserBlock("steer one"); f.event("turn_start"); f.core.handleUserBlock("steer two");
+    await new Promise(resolve => setImmediate(resolve));
+    const opened = f.posts.filter(p => p.type === "turn" && p.state === "opened");
+    expect(opened.at(-1)).toMatchObject({ runId: "run", nativeTurnId: "pi-invocation-1", acceptedTurnIds: ["1", "2", "3"] });
+    expect(new Set(opened.map(p => p.nativeTurnId)).size).toBe(1);
+    f.event("agent_end"); f.core.handleUserBlock("next"); f.event("agent_start");
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.posts).toContainEqual(expect.objectContaining({ type: "turn", state: "closed", nativeTurnId: "pi-invocation-1" }));
+    expect(f.posts.at(-1)).toMatchObject({ type: "turn", state: "opened", nativeTurnId: "pi-invocation-2" });
+  });
+  it("holds all successor writes across native end until cancellation preparation rechecks E", async () => {
+    const f = managed(); f.core.handleUserBlock("start"); f.event("agent_start");
+    expect(f.core.prepareNativeCancellation({ runId: "run", nativeTurnId: "pi-invocation-1" })).toBe(true);
+    f.core.handleUserBlock("/followup future"); f.core.handleUserBlock("person future");
+    await f.core.acceptRunnerRequest(f.frame("managed future", 1, "input"));
+    f.event("agent_end"); await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc.filter(p => ["future", "person future", "managed future"].includes(String(p.message)))).toEqual([]);
+    expect(f.core.recheckNativeCancellation({ runId: "run", nativeTurnId: "pi-invocation-1" })).toBe(false);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.rpc).toContainEqual(expect.objectContaining({ type: "prompt", message: "future" }));
+    expect(f.rpc.filter(p => p.type === "abort")).toEqual([]);
+    expect(f.core.nativeChannelCapabilities().cancel).toBe(false);
+  });
+  it("holds native followups in the runner and refuses accepted-ordinal or stale cancellation targets", () => {
+    const f = managed(); f.core.handleUserBlock("start"); f.event("agent_start");
+    f.core.handleUserBlock("/followup next");
+    expect(f.rpc.filter(p => p.type === "follow_up")).toEqual([]);
+    expect(f.core.prepareNativeCancellation({ runId: "run", nativeTurnId: "1" })).toBe(false);
+    expect(f.core.prepareNativeCancellation({ runId: "other", nativeTurnId: "pi-invocation-1" })).toBe(false);
+  });
   it("a person/startup preflight cannot race a dedicated wake before agent_start", async () => {
     const f = managed(); f.core.handleUserBlock("person startup");
     await f.core.acceptRunnerRequest(f.frame("question", 1, "wake"));
