@@ -190,6 +190,18 @@ describe("native runner receipts", () => {
     expect(outbox.getById("native-1")?.deliveryState).toBe("delivered");
     expect(outbox.updateRunner("node-1", "run-1", "native-1", 1, "accepted").stage).toBe("submitted");
   });
+  it("never changes a completed input's epoch, accepted ordinal, result, node or run on a late report", () => {
+    outbox.admitRunner(input());
+    for (const stage of ["offered", "accepted", "submitted"] as const) outbox.updateRunner("node-1", "run-1", "native-1", 1, stage);
+    const evidence = { nativeTurnId: "epoch-E", acceptedTurnId: "1", result: { kind: "input", accepted: true } };
+    const saved = outbox.updateRunner("node-1", "run-1", "native-1", 1, "completed", evidence);
+    for (const changed of [{ ...evidence, nativeTurnId: "epoch-F" }, { ...evidence, acceptedTurnId: "2" }, { ...evidence, result: { kind: "input", accepted: false } }])
+      expect(() => outbox.updateRunner("node-1", "run-1", "native-1", 1, "completed", changed)).toThrow();
+    expect(() => outbox.updateRunner("node-1", "other-run", "native-1", 1, "completed", evidence)).toThrow();
+    expect(() => outbox.updateRunner("other-node", "run-1", "native-1", 1, "completed", evidence)).toThrow();
+    expect(outbox.updateRunner("node-1", "run-1", "native-1", 1, "completed", evidence)).toEqual(saved);
+    expect(outbox.runnerReceipt("native-1")).toEqual(saved);
+  });
   it("resolves any grouped member after store restart and rejects changed membership or member collisions atomically", () => {
     for (const id of ["first", "second", "third"]) outbox.record({ ...input(id), body: id });
     const operation = { ...input("first"), body: "first", memberIds: ["first", "second"], payload: { text: "combined" } };
