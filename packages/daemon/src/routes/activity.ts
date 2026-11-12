@@ -155,6 +155,12 @@ activityRoutes.post("/runner-channel", async c => {
     const channel = channelService(c), token = channelToken(c);
     channel.authenticate(token);
     const body = await c.req.json().catch(() => null);
+    if (body && typeof body === "object" && (body as Record<string, unknown>).type === "cancel-prepare") {
+      const ctx = permissionContext(c, false);
+      if ("refused" in ctx) return ctx.refused;
+      return c.json(channel.prepareCancellation(token, body as Record<string, unknown>, (grant, target) => ctx.permissions.withdrawTurn(
+        { nodeId: grant.nodeId, sessionName: ctx.store.resolveSession({ nodeId: grant.nodeId })?.sessionName ?? "", generation: grant.generation }, target)));
+    }
     return c.json(channel.post(token, body));
   } catch (error) { return channelFailure(c, error); }
 });
