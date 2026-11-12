@@ -548,7 +548,7 @@ export class RunnerCore {
   isReady(): boolean { return this.ready; }
   nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined && this.runtime === "pi", wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: this.ready && !this.managedQuarantined && this.runtime === "pi" && !!this.io.withdrawNativeTurn }; }
 
-  /** Internal preparation only: no abort is submitted and the public capability remains false. */
+  /** Install the local preparation fence; this method alone submits no native operation. */
   prepareNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
     if (this.runtime !== "pi" || !this.ready || this.managedQuarantined || !this.nativeTurn
       || !this.nativeTurn.owned || target.runId !== this.identity.runId || target.nativeTurnId !== this.nativeTurn.id
@@ -574,7 +574,7 @@ export class RunnerCore {
   }
 
   private pumpPersonPrompts(): void {
-    if (this.cancellationFence || this.streaming || this.pendingManagedStart || !this.ready || this.managedQuarantined) return;
+    if (this.cancellationFence || this.streaming || this.pendingManagedStart || !this.ready) return;
     const command = this.heldPersonPrompts.shift();
     if (command) this.personPrompt(command.type === "follow_up" ? { type: "prompt", message: command.message, streamingBehavior: "steer" } : command);
   }
@@ -679,14 +679,24 @@ export class RunnerCore {
     this.managed.set(frame.requestId, entry);
     const named = frame.kind === "cancel" ? frame.payload.target! : null;
     const prepared = named && !this.cancellation && this.prepareNativeCancellation(named);
-    if (prepared) this.cancellation = { entry, target: named!, submitted: false, acknowledged: false, ended: false, aborted: false };
+    const operation = prepared ? { entry, target: named!, submitted: false, acknowledged: false, ended: false, aborted: false } : null;
+    if (operation) this.cancellation = operation;
     entry.acceptance = (async () => {
       const accepted = await this.io.postRunner!({ type: "ack", runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, state: "accepted" });
-      if (!accepted) { entry.state = "unavailable"; return; }
+      if (!accepted) {
+        entry.state = "unavailable";
+        if (operation && this.cancellation === operation && !operation.submitted) {
+          this.cancellation = null;
+          if (this.cancellationFence === operation.target.nativeTurnId) this.cancellationFence = null;
+          this.pumpPersonPrompts(); this.pumpManaged();
+        }
+        return;
+      }
+      if (operation && this.cancellation !== operation) return;
       if (named) {
         entry.state = "queued";
         if (!prepared) { entry.state = "terminal"; this.reportManaged(entry, "result", { kind: "cancel", outcome: this.nativeTurn?.id === named.nativeTurnId ? "not-supported" : "not-this-turn", confirmed: false }); }
-        else void this.performNativeCancellation(this.cancellation!).catch(() => {});
+        else void this.performNativeCancellation(operation!).catch(() => {});
         return;
       }
       entry.state = "queued"; this.managedQueue.push(entry); this.managedQueue.sort((a, b) => a.frame.sequence - b.frame.sequence); this.pumpManaged();
@@ -707,16 +717,26 @@ export class RunnerCore {
     if (!this.io.withdrawNativeTurn) { this.finishNativeCancellation("not-supported"); return; }
     for (;;) {
       const withdrawal = await this.io.withdrawNativeTurn({ type: "cancel-prepare", runId: entry.frame.runId, requestId: entry.frame.requestId, sequence: entry.frame.sequence });
+      if (this.cancellation !== operation) return;
       if (!this.nativeTurn || this.nativeTurn.id !== target.nativeTurnId || withdrawal?.notThisTurn) { this.finishNativeCancellation("not-this-turn"); return; }
       if (withdrawal?.confirmed) break;
       if (!this.ready || this.cancellation !== operation) return;
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    if (!this.ready || this.managedQuarantined || this.nativeTurn?.id !== target.nativeTurnId) { this.finishNativeCancellation("not-this-turn"); return; }
-    operation.submitted = true;
-    entry.state = "submitted";
-    this.io.sendRpc({ type: "abort", id: `openrig-cancel-${entry.frame.requestId}` });
-    this.reportManaged(entry, "submitted", { kind: "cancel", outcome: "requested", confirmed: false, operationAccepted: false });
+    if (!this.ready || this.nativeTurn?.id !== target.nativeTurnId) { this.finishNativeCancellation("not-this-turn"); return; }
+    if (!this.nativeTurn.owned || this.managedQuarantined || !this.ownsNativeCancellationQueue()) {
+      this.managedQuarantined = true; this.finishNativeCancellation("not-supported", "native_queue_ownership_unknown"); return;
+    }
+    // The state reply is correlated to this captured preparation. E is rechecked again after the await.
+    this.io.sendRpc({ type: "get_state", id: `openrig-cancel-preflight-${entry.frame.requestId}` });
+  }
+
+  private ownsNativeCancellationQueue(pending?: number): boolean {
+    if (this.nativeQueues && (this.nativeQueues.followUp.length > 0 || this.nativeQueues.steering.some(text => !this.epochSteers.has(text)))) return false;
+    if (pending === undefined) return true;
+    if (!Number.isSafeInteger(pending) || pending < 0) return false;
+    return pending === 0 ? !this.nativeQueues || this.nativeQueues.steering.length === 0
+      : !!this.nativeQueues && this.nativeQueues.steering.length === pending;
   }
 
   private finishNativeCancellation(outcome: "cancelled" | "requested" | "not-this-turn" | "not-supported", detail?: string): void {
@@ -837,6 +857,20 @@ export class RunnerCore {
 
   private handleResponse(record: Record<string, unknown>): void {
     const cancellation = this.cancellation;
+    if (cancellation && !cancellation.submitted && record.id === `openrig-cancel-preflight-${cancellation.entry.frame.requestId}`) {
+      const state = record.data as { isStreaming?: boolean; pendingMessageCount?: number } | undefined;
+      if (!this.ready || this.nativeTurn?.id !== cancellation.target.nativeTurnId || cancellation.ended || state?.isStreaming === false) {
+        this.finishNativeCancellation("not-this-turn"); return;
+      }
+      if (record.success !== true || state?.isStreaming !== true || typeof state.pendingMessageCount !== "number"
+        || !this.nativeTurn.owned || this.managedQuarantined || !this.ownsNativeCancellationQueue(state.pendingMessageCount)) {
+        this.managedQuarantined = true; this.finishNativeCancellation("not-supported", "native_queue_ownership_unknown"); return;
+      }
+      cancellation.submitted = true; cancellation.entry.state = "submitted";
+      this.io.sendRpc({ type: "abort", id: `openrig-cancel-${cancellation.entry.frame.requestId}` });
+      this.reportManaged(cancellation.entry, "submitted", { kind: "cancel", outcome: "requested", confirmed: false, operationAccepted: false });
+      return;
+    }
     if (cancellation && record.id === `openrig-cancel-${cancellation.entry.frame.requestId}`) {
       if (record.success === true) { cancellation.acknowledged = true; this.checkCancelledNativeIdle(); }
       return;
