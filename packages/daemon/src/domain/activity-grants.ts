@@ -116,7 +116,7 @@ export class ActivityGrantStore {
       if (active?.runId && active.grantId > grant.grantId && this.matchesBinding(active, true)) return false;
       const session = this.currentSession(grant.nodeId)!;
       // Only this pending, Core-selected launch may fill an empty declaration; never overwrite a conflicting record.
-      if (grant.binding!.runtime !== "pi" && session.agent_app == null && session.agent_runner == null) {
+      if (grant.binding!.runtime !== "pi" && grant.binding!.runtime !== "omp" && session.agent_app == null && session.agent_runner == null) {
         this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?")
           .run(grant.binding!.runtime, grant.binding!.runner, session.id);
       }
@@ -145,7 +145,7 @@ export class ActivityGrantStore {
           && this.adoptionAnchorMatches(grant, session.session_name))));
       if (candidates.length === 1) {
         const grant = candidates[0]!;
-        if (grant.binding!.runtime !== "pi" && session.agent_app == null && session.agent_runner == null) {
+        if (grant.binding!.runtime !== "pi" && grant.binding!.runtime !== "omp" && session.agent_app == null && session.agent_runner == null) {
           this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?")
             .run(grant.binding!.runtime, grant.binding!.runner, session.id);
         }
@@ -204,8 +204,10 @@ export class ActivityGrantStore {
     try {
       const anchor = grant.binding, session = this.currentSession(grant.nodeId);
       if (!anchor || !session || session.tmux_pane !== anchor.pane || session.runtime !== anchor.runtime
-        || (anchor.runtime !== "pi" && (session.agent_app !== anchor.runtime || session.agent_runner !== anchor.runner)
-          && !(allowUnrecorded && session.agent_app == null && session.agent_runner == null && [1, 2].includes(anchor.runner)))) return false;
+        || (anchor.runtime === "omp"
+          ? anchor.runner !== 0 || session.agent_app != null || (session.agent_runner ?? 0) !== 0
+          : anchor.runtime !== "pi" && (session.agent_app !== anchor.runtime || session.agent_runner !== anchor.runner)
+            && !(allowUnrecorded && session.agent_app == null && session.agent_runner == null && [1, 2].includes(anchor.runner)))) return false;
       const registry = new SessionRegistry(this.db);
       const current = registry.currentOccupantTenure(grant.nodeId)?.generationUuid;
       const adoption = current !== grant.generation;

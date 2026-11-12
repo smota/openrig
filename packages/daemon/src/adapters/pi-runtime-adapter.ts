@@ -346,7 +346,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     // The prior record is read FIRST so the durable catch-up cursor
     // (lastEntryId, FR-5) survives the reset.
     const launchId = this.newLaunchId();
-    const authority = this.runtime !== "omp" ? await this.runnerGrants?.(binding, this.runtime, launchId, this.runtime === "pi" ? 0 : 2) : undefined;
+    const authority = await this.runnerGrants?.(binding, this.runtime, launchId, this.runtime === "pi" || this.runtime === "omp" ? 0 : 2);
     let authorizedLaunchSucceeded = false;
     try {
       const prior = this.readRunnerState(location.sessionName, location.stateRoot);
@@ -435,8 +435,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
 
       // OMP lazily creates its JSONL on the first persisted turn. Readiness
       // is real, but until then there is no history to resume after a reboot.
-      if (this.runtime === "omp" && !this.fs.exists(validation.token)) return { ok: true, appliedLaunch };
       authorizedLaunchSucceeded = true;
+      if (this.runtime === "omp" && !this.fs.exists(validation.token)) return { ok: true, appliedLaunch,
+        ...(authority ? { activityGrantId: authority.grantId } : {}) };
       return { ok: true, resumeToken: validation.token, resumeType: this.resumeType, appliedLaunch,
         ...(authority ? { activityGrantId: authority.grantId } : {}) };
     } finally { await authority?.finish(authorizedLaunchSucceeded); }

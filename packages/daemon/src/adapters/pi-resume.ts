@@ -109,10 +109,8 @@ export class PiResumeAdapter {
     // read FIRST so the durable catch-up cursor (lastEntryId, FR-5) survives.
     const launchId = (this.options.newLaunchId ?? (() => randomUUID()))();
     let authority: RunnerGrantLaunch | undefined;
-    if (this.runtime === "pi") {
-      try { authority = await this.options.runnerGrant?.(tmuxSessionName, launchId, cwd); }
-      catch { return { ok: false, code: "resume_failed", message: "Pi resume authority is unavailable; no runner started." }; }
-    }
+    try { authority = await this.options.runnerGrant?.(tmuxSessionName, launchId, cwd); }
+    catch { return { ok: false, code: "resume_failed", message: `${this.label} resume authority is unavailable; no runner started.` }; }
     let launchSucceeded = false;
     try {
       const prior = this.fs.exists(seat.runnerStatePath) ? parsePiRunnerState(this.readSafe(seat.runnerStatePath)) : null;
