@@ -58,7 +58,7 @@ function seatDeps(runner: WakeRunner, resolution: unknown, httpStatus = 200): St
       ),
       fetch: vi.fn(async () => ({ ok: true })),
     },
-    clientFactory: () => ({ post }) as never,
+    clientFactory: () => ({ post, get: vi.fn(async () => ({ status: 404, data: {} })) }) as never,
     wakeRunner: runner,
     wakeFileLocator: () => null,
     __post: post,
@@ -291,4 +291,59 @@ describe("rig ask --wake (L3 CLI)", () => {
     expect(logs.join("\n")).toMatch(/runtime .*not supported/i);
   });
 
+});
+
+
+it("uses a live declared native wake and polls its exact request instead of a saved-session runner", async () => {
+  const vendor: WakeRunner = vi.fn(); const deps = seatDeps(vendor, {});
+  const calls: string[] = []; let requestId = "";
+  deps.clientFactory = () => ({
+    get: async (path: string) => {
+      calls.push(path);
+      return path.includes("/status/") ? { status: 200, data: { inputRoute: "native", nativeInput: { wake: true } } }
+        : { status: 200, data: { receipt: { requestId, stage: "completed", result: { kind: "wake", completion: "completed", answer: "dedicated answer" } } } };
+    },
+    post: async (path: string, body: { requestId: string }) => { calls.push(path); requestId = body.requestId;
+      return { status: 202, data: { runnerReceipt: { requestId, stage: "accepted" } } }; },
+  }) as never;
+  const result = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "r", "question", "--wake", "dev@r", "--json"]));
+  expect(vendor).not.toHaveBeenCalled(); expect(requestId).toMatch(/^wake-/);
+  expect(calls).toContain(`/api/seat/command/dev%40r?requestId=${requestId}`);
+  expect(calls).not.toContain("/api/wake-resolve");
+  expect(JSON.parse(result.logs[0]!)).toMatchObject({ requestId, receipt: { result: { answer: "dedicated answer" } } });
+});
+it("a native caller timeout keeps its request ID/stage and never cancels or submits a fallback", async () => {
+  const vendor: WakeRunner = vi.fn(); const deps = seatDeps(vendor, {}); const calls: string[] = []; let requestId = "";
+  deps.clientFactory = () => ({
+    get: async (path: string) => { calls.push(path); return path.includes("/status/")
+      ? { status: 200, data: { inputRoute: "native", nativeInput: { wake: true } } }
+      : { status: 200, data: { receipt: { requestId, stage: "accepted" } } }; },
+    post: async (path: string, body: { requestId: string }) => { calls.push(path); requestId = body.requestId; return { status: 202, data: { runnerReceipt: { requestId, stage: "accepted" } } }; },
+  }) as never;
+  const result = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "r", "question", "--wake", "dev@r", "--wake-timeout", "1", "--json"]));
+  expect(vendor).not.toHaveBeenCalled(); expect(calls.some(path => path.includes("cancel") || path.includes("wake-resolve"))).toBe(false);
+  expect(JSON.parse(result.logs[0]!)).toMatchObject({ requestId: expect.stringMatching(/^wake-/), timedOut: true, receipt: { stage: "accepted" } });
+  expect(result.exitCode).toBe(2);
+});
+
+it.each(["claude", "codex"])("keeps the historical %s wake on a typed route even when a runner advertises wake", async runtime => {
+  const runner: WakeRunner = vi.fn(async () => ({ stdout: "legacy answer", stderr: "", code: 0, timedOut: false }));
+  const deps = seatDeps(runner, { resolved: true, token: "original-token", runtime, sessionId: 7 });
+  const client = deps.clientFactory();
+  deps.clientFactory = () => ({ ...client, get: vi.fn(async () => ({ status: 200, data: { inputRoute: "typed", nativeInput: { wake: true } } })) }) as never;
+  const result = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "r", "question", "--wake", "dev@r"]));
+  expect(runner).toHaveBeenCalledOnce(); expect(result.exitCode).toBeUndefined();
+  expect((deps as any).__post).toHaveBeenCalledWith("/api/wake-resolve", expect.anything());
+});
+
+it("refuses an explicitly selected native wake without a capable runner and never falls back", async () => {
+  const runner: WakeRunner = vi.fn(); const deps = seatDeps(runner, {}); const calls: string[] = [];
+  deps.clientFactory = () => ({
+    get: async (path: string) => { calls.push(path); return { status: 200, data: { inputRoute: "native", nativeInput: { wake: false } } }; },
+    post: async (path: string) => { calls.push(path); return { status: 409, data: { reason: "runner_unavailable" } }; },
+  }) as never;
+  const result = await captureLogs(() => makeCmd(deps).parseAsync(["node", "rig", "ask", "r", "question", "--wake", "dev@r", "--json"]));
+  expect(runner).not.toHaveBeenCalled(); expect(result.exitCode).toBe(2);
+  expect(calls).toEqual(["/api/seat/status/dev%40r", "/api/seat/command/dev%40r"]);
+  expect(JSON.parse(result.logs[0]!)).toMatchObject({ error: "runner_unavailable" });
 });
