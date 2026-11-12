@@ -229,6 +229,21 @@ describe("native runner receipts", () => {
     expect(outbox.updateRunner("node-1", "run-1", "native-1", 1, "completed", { result }).result).toEqual(result);
     expect(outbox.getById("native-1")?.deliveryState).toBe("indeterminate");
   });
+  it("erased cancellation retains only opaque target/withdrawal proof and refuses replay or late writes", () => {
+    db.exec("ALTER TABLE outbox_entries ADD COLUMN guard_binding TEXT");
+    const request = { ...input(), kind: "cancel" as const, payload: { target: { runId: "run-1", nativeTurnId: "E" } } };
+    outbox.admitRunner(request);
+    for (const stage of ["offered", "accepted"] as const) outbox.updateRunner("node-1", "run-1", "native-1", 1, stage);
+    outbox.recordRunnerWithdrawal("node-1", "run-1", "native-1", 1, { confirmed: true, pendingSubmissions: 0, withdrawn: 2 });
+    outbox.updateRunner("node-1", "run-1", "native-1", 1, "submitted", { result: { kind: "cancel", outcome: "requested", confirmed: false, detail: "PRIVATE DETAIL", extra: "PRIVATE RESULT" } });
+    const hash = outbox.runnerReceipt("native-1")!.bindingHash;
+    outbox.eraseRunner("native-1", "2026-11-12T00:00:00Z");
+    const erased = outbox.runnerReceipt("native-1")!;
+    expect(erased).toMatchObject({ payload: request.payload, bindingHash: hash, withdrawal: { stage: "confirmed", withdrawn: 2 }, result: { kind: "cancel", outcome: "requested", confirmed: false } });
+    expect(JSON.stringify(erased)).not.toContain("PRIVATE");
+    expect(() => outbox.admitRunner(request)).toThrow(/erased/);
+    expect(() => outbox.updateRunner("node-1", "run-1", "native-1", 1, "completed", { result: { kind: "cancel", outcome: "cancelled", confirmed: true } })).toThrow(/erased/);
+  });
   it("reconciles lost receiver memory as uncertainty without reoffering", () => {
     outbox.admitRunner(input());
     outbox.updateRunner("node-1", "run-1", "native-1", 1, "offered");
