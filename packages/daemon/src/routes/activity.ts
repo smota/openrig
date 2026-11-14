@@ -256,7 +256,8 @@ function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant
  *  the same launch. `outcome` says what the refusal left undone. */
 function grantStandingRefusal(c: Context, store: AgentActivityStore, grant: ActivityGrant, outcome: string, revoked = false): Response | null {
   if (grant.runId) {
-    const standing = new ActivityGrantStore(store.db).standing(grant.grantId);
+    let standing: ReturnType<ActivityGrantStore["standing"]> = "unverified";
+    try { standing = new ActivityGrantStore(store.db).standing(grant.grantId); } catch { /* Unreadable authority is not a revoked run. */ }
     if (standing === "current") return null;
     if (standing === "unverified") {
       return c.json({ ok: false, code: "activity_grant_unverified", retryable: true,
@@ -1025,9 +1026,14 @@ async function submitPermission(c: Context, installTokenAccepted: boolean): Prom
   const parsed = parseRunnerPermissionRequest(body);
   if (!parsed.ok) return c.json({ ok: false, code: "invalid_permission_request", error: parsed.message }, 400);
   if (parsed.request.runId) {
-    const current = (c.get("runnerChannel" as never) as RunnerChannel | undefined)?.currentTurn(seat.nodeId);
+    let current: ReturnType<RunnerChannel["currentTurn"]> = null;
+    if (ctx.grant?.runId && ctx.grant.runId === parsed.request.runId) {
+      const refused = grantStandingRefusal(c, ctx.store, ctx.grant, "nothing was asked.");
+      if (refused) return refused;
+      try { current = (c.get("runnerChannel" as never) as RunnerChannel | undefined)?.currentTurn(seat.nodeId, true) ?? null; }
+      catch (error) { return channelFailure(c, error); }
+    }
     if (!ctx.grant?.runId || ctx.grant.runId !== parsed.request.runId
-      || new ActivityGrantStore(ctx.store.db).standing(ctx.grant.grantId) !== "current"
       || current?.runId !== parsed.request.runId || current.nativeTurnId !== parsed.request.nativeTurnId
       || !current.acceptedTurnIds.includes(parsed.request.turnId))
       return c.json({ ok: false, code: "runner_turn_unbound", error: "Permission metadata needs current bound native turn evidence." }, 409);

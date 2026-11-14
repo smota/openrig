@@ -317,7 +317,7 @@ async function main() {
   let nativeTurnSequence = 0;
   let nativeTurnPosts = Promise.resolve();
   const reportTurn = (scope, status, acceptedTurnId) => {
-    if (!scope || !env.OPENRIG_RUN_ID || !env.OPENRIG_ACTIVITY_HOOK_TOKEN) return Promise.resolve();
+    if (!scope || !env.OPENRIG_RUN_ID || !env.OPENRIG_ACTIVITY_HOOK_TOKEN?.startsWith("oag_")) return Promise.resolve();
     const body = { type: "turn", runId: env.OPENRIG_RUN_ID, sequence: ++nativeTurnSequence,
       nativeTurnId: scope.nativeTurnId, state: status, acceptedTurnIds: [acceptedTurnId] };
     nativeTurnPosts = nativeTurnPosts.then(() => channelPost(body));
@@ -525,7 +525,7 @@ async function main() {
     const submitted = await callOpenRig("POST", "/api/activity/permission-requests", {
       sessionName: env.OPENRIG_SESSION_NAME, nodeId: env.OPENRIG_NODE_ID, generation: env.OPENRIG_OCCUPANT_GENERATION,
       nativeRef: state.sessionId, turnId: String(turn),
-      ...(env.OPENRIG_RUN_ID && peer.promptScope() ? { runId: env.OPENRIG_RUN_ID, nativeTurnId: peer.promptScope().nativeTurnId } : {}), requestId: String(requestId), toolCall,
+      ...(env.OPENRIG_ACTIVITY_HOOK_TOKEN?.startsWith("oag_") && env.OPENRIG_RUN_ID && peer.promptScope() ? { runId: env.OPENRIG_RUN_ID, nativeTurnId: peer.promptScope().nativeTurnId } : {}), requestId: String(requestId), toolCall,
       options: options.map((option) => ({ optionId: option.optionId, name: option.name ?? option.optionId, kind: option.kind })),
       occurredAt: new Date().toISOString(),
     }, 10_000);

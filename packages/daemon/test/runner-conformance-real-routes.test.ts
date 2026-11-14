@@ -301,6 +301,46 @@ describe("run-bound native channel custody", () => {
     expect(f.outbox.runnerReceipt(ordinary.requestId)?.stage).toBe("pending");
     expect((await f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, target: { ...request.target, nativeTurnId: "F" } }) })).status).toBe(409);
   });
+  it.each(["binding", "failed read"])("keeps %s cancellation uncertainty separate from a changed native turn", async cause => {
+    const f = await fixture(); f.channel.post(f.grant.token, f.hello);
+    cleanups.push(f.channel.connect(f.grant.token));
+    f.channel.post(f.grant.token, { type: "turn", runId: "run-one", sequence: 1, nativeTurnId: "E", state: "opened", acceptedTurnIds: ["1"] });
+    const request = { type: "cancel", requestId: "uncertain-cancel", target: { runId: "run-one", nativeTurnId: "E" } };
+    const cancel = () => f.app.request("/api/seat/command/dev@channel", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+    const standing = f.grants.standing.bind(f.grants);
+    const fault = vi.spyOn(f.grants, "standing").mockImplementation(id => {
+      if (cause === "binding") return "unverified";
+      const prepare = f.db.prepare.bind(f.db);
+      const read = vi.spyOn(f.db, "prepare").mockImplementation(((sql: string) => {
+        if (sql === "PRAGMA table_info(activity_grants)") throw new Error("standing read unavailable");
+        return prepare(sql);
+      }) as typeof f.db.prepare);
+      try { return standing(id); } finally { read.mockRestore(); }
+    });
+    try {
+      expect(f.channel.currentTurn(f.node.id)).toBeNull();
+      const refused = await cancel();
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ code: "runner_grant_unverified", retryable: true });
+      expect(f.outbox.runnerReceipt(request.requestId)).toBeNull();
+      expect(f.grants.get(f.grant.grantId)?.revokedAt).toBeNull();
+    } finally { fault.mockRestore(); }
+    const accepted = await cancel(); expect(accepted.status).toBe(202);
+    const receipt = f.outbox.runnerReceipt(request.requestId)!;
+    f.channel.frames(f.grant.token, 0);
+    f.channel.post(f.grant.token, { type: "ack", runId: "run-one", requestId: request.requestId, sequence: receipt.sequence, state: "accepted" });
+    const saved = f.outbox.runnerReceipt(request.requestId), withdraw = vi.fn(() => ({ confirmed: true, pendingSubmissions: 0, withdrawn: 0 }));
+    let calls = 0;
+    const uncertainTarget = vi.spyOn(f.grants, "standing").mockImplementation(id => ++calls === 1 ? standing(id) : "unverified");
+    try {
+      expect(() => f.channel.prepareCancellation(f.grant.token, { type: "cancel-prepare", runId: "run-one", requestId: request.requestId, sequence: receipt.sequence }, withdraw)).toThrow(/unverified/);
+      expect(withdraw).not.toHaveBeenCalled();
+      expect(f.outbox.runnerReceipt(request.requestId)).toEqual(saved);
+    } finally { uncertainTarget.mockRestore(); }
+    expect(f.channel.prepareCancellation(f.grant.token, { type: "cancel-prepare", runId: "run-one", requestId: request.requestId, sequence: receipt.sequence }, withdraw))
+      .toMatchObject({ withdrawal: { confirmed: true } });
+    expect(withdraw).toHaveBeenCalledTimes(1);
+  });
   it.each([false, true])("explicit receiver map loss invalidates E durably with only completed receipts=%s", async completedReceipt => {
     const dir = mkdtempSync(join(tmpdir(), "native-empty-map-")), file = join(dir, "core.sqlite");
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -339,6 +379,9 @@ describe("run-bound native channel custody", () => {
     expect(reopened.channel.currentTurn(f.node.id)).toBeNull();
     expect(reopened.outbox.runnerReceipts(f.node.id, "run-one")).toEqual(receipts);
     expect(reopened.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='agent.runner_map_lost'").get()).toEqual({ n: 1 });
+    const command = { requestId: "after-map-loss", sender: "s", destination: "dev@channel", target: { runId: "run-one", nativeTurnId: "person-E" } };
+    expect(() => reopened.channel.cancel(f.node.id, command)).toThrow(/ownership is unknown/);
+    expect(reopened.outbox.runnerReceipt(command.requestId)).toBeNull();
     const next = reopened.grants.issue({ nodeId: f.node.id, generation: f.grant.generation, issuedBy: "replacement",
       run: { runId: "run-two", binding: f.grant.binding! } });
     expect(reopened.grants.activate(next.grantId)).toBe(true);
@@ -346,6 +389,63 @@ describe("run-bound native channel custody", () => {
     reopened.channel.post(next.token, { ...turn, runId: "run-two", nativeTurnId: "F" });
     expect(reopened.channel.currentTurn(f.node.id)).toMatchObject({ runId: "run-two", nativeTurnId: "F" });
     const close = reopened.channel.connect(next.token); expect(reopened.channel.capable(f.node.id, "cancel")).toBe(true); close();
+  });
+  it("retains cancellation preparation while another native receipt needs reconciliation", async () => {
+    const f = await fixture(); f.channel.post(f.grant.token, f.hello); cleanups.push(f.channel.connect(f.grant.token));
+    f.channel.post(f.grant.token, { type: "turn", runId: "run-one", sequence: 1, nativeTurnId: "E", state: "opened", acceptedTurnIds: ["1"] });
+    const target = { runId: "run-one", nativeTurnId: "E" };
+    const receipt = f.channel.cancel(f.node.id, { requestId: "held-cancel", sender: "s", destination: "dev@channel", target });
+    f.channel.frames(f.grant.token, 0);
+    f.channel.post(f.grant.token, { type: "ack", runId: "run-one", requestId: receipt.requestId, sequence: receipt.sequence, state: "accepted" });
+    const saved = f.outbox.runnerReceipt(receipt.requestId);
+    const unknown = f.outbox.admitRunner({ outboxId: "unknown-wake", senderSession: "s", destinationSession: "dev@channel", body: "wake",
+      nodeId: f.node.id, runId: "run-one", kind: "wake", inputRoute: "native", payload: { question: "wake" } });
+    for (const stage of ["offered", "accepted", "submitted"] as const) f.outbox.updateRunner(f.node.id, "run-one", unknown.requestId, unknown.sequence, stage);
+    f.outbox.updateRunner(f.node.id, "run-one", unknown.requestId, unknown.sequence, "completed",
+      { result: { kind: "wake", completion: "unknown", answer: null, ownershipUnknown: true } });
+    expect(f.channel.currentTurn(f.node.id)).toBeNull();
+    const withdraw = vi.fn(() => ({ confirmed: true, pendingSubmissions: 0, withdrawn: 0 }));
+    expect(() => f.channel.prepareCancellation(f.grant.token, { type: "cancel-prepare", runId: "run-one", requestId: receipt.requestId, sequence: receipt.sequence }, withdraw))
+      .toThrow(/ownership is unknown/);
+    expect(withdraw).not.toHaveBeenCalled(); expect(f.outbox.runnerReceipt(receipt.requestId)).toEqual(saved);
+    expect(() => f.channel.cancel(f.node.id, { requestId: "new-cancel", sender: "s", destination: "dev@channel", target })).toThrow(/ownership is unknown/);
+    expect(f.outbox.runnerReceipt("new-cancel")).toBeNull();
+  });
+  it.each([[2, "unverified"], [2, "failed read"], [3, "unverified"], [3, "failed read"]] as const)
+    ("keeps permission metadata standing read %s %s retryable without recording a request", async (at, cause) => {
+    const f = await fixture(); f.channel.post(f.grant.token, f.hello);
+    f.channel.post(f.grant.token, { type: "turn", runId: "run-one", sequence: 1, nativeTurnId: "E", state: "opened", acceptedTurnIds: ["1"] });
+    const { ActivityGrantStore } = await import("../src/domain/activity-grants.js");
+    const standing = ActivityGrantStore.prototype.standing;
+    let calls = 0;
+    const fault = vi.spyOn(ActivityGrantStore.prototype, "standing").mockImplementation(function (this: InstanceType<typeof ActivityGrantStore>, id) {
+      if (++calls !== at) return standing.call(this, id);
+      if (cause === "unverified") return "unverified";
+      const prepare = f.db.prepare.bind(f.db);
+      const read = vi.spyOn(f.db, "prepare").mockImplementation(((sql: string) => {
+        if (sql === "PRAGMA table_info(activity_grants)") throw new Error("standing read unavailable");
+        return prepare(sql);
+      }) as typeof f.db.prepare);
+      try { return standing.call(this, id); } finally { read.mockRestore(); }
+    });
+    const body = { nodeId: f.node.id, sessionName: "dev@channel", generation: f.grant.generation,
+      runId: "run-one", nativeTurnId: "E", nativeRef: "native", turnId: "1", requestId: "late-auth",
+      toolCall: { title: "edit" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] };
+    const post = () => f.app.request("/api/activity/permission-requests", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.grant.token}` }, body: JSON.stringify(body) });
+    const before = f.db.prepare("SELECT COUNT(*) AS n FROM events").get();
+    try {
+      const refused = await post(); expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ code: expect.stringMatching(/^(activity|runner)_grant_unverified$/), retryable: true });
+      expect(f.db.prepare("SELECT COUNT(*) AS n FROM events").get()).toEqual(before);
+      expect(f.queueRepo.list({ limit: 100 })).toEqual([]);
+      expect(f.grants.get(f.grant.grantId)?.revokedAt).toBeNull();
+    } finally { fault.mockRestore(); }
+    expect((await post()).status).toBe(200);
+    const missing = await postWithMissingTurn(); expect(missing.status).toBe(409);
+    expect(await missing.json()).toMatchObject({ code: "runner_turn_unbound" });
+    async function postWithMissingTurn() {
+      return f.app.request("/api/activity/permission-requests", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.grant.token}` }, body: JSON.stringify({ ...body, nativeTurnId: "missing" }) });
+    }
   });
   it("keeps retained E and permission binding during SSE disconnect without pretending unknown is idle", async () => {
     const f = await fixture(); f.channel.post(f.grant.token, f.hello);

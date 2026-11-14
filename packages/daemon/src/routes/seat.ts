@@ -84,7 +84,8 @@ seatRoutes.post("/command/:seatRef", async c => {
       const receipt = await guard.custody([target.nodeId], async () => channel.cancel(target.nodeId, { requestId: body.requestId as string,
         sender: transportSenderSession(c) ?? "unknown", destination: target.session, target: { runId: named.runId as string, nativeTurnId: named.nativeTurnId as string } }));
       return c.json({ receipt }, receipt.stage === "completed" ? 200 : 202);
-    } catch (error) { return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, 409); }
+    } catch (error) { return c.json({ error: (error as Error).message, code: (error as { code?: string }).code,
+      ...((error as { code?: string }).code === "runner_grant_unverified" ? { retryable: true } : {}) }, 409); }
   }
   if (!body || body.type !== "wake" || typeof body.requestId !== "string" || !body.requestId.trim()
     || body.requestId.length > 512 || typeof body.question !== "string" || !body.question.trim() || body.question.length > 1024 * 1024)

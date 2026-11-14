@@ -59,7 +59,7 @@ export class RunnerChannel {
       inputRoute: "native" as const, payload: { target } };
     const prior = this.outbox.runnerReceipt(input.requestId);
     if (prior) return this.outbox.admitRunner(admitted);
-    const current = this.currentTurn(nodeId);
+    const current = this.currentTurn(nodeId, true);
     const matching = current?.runId === target.runId && current.nativeTurnId === target.nativeTurnId;
     let receipt = this.outbox.admitRunner(admitted);
     if (!matching || !this.capable(nodeId, "cancel")) {
@@ -78,7 +78,7 @@ export class RunnerChannel {
       || receipt.sequence !== body.sequence || receipt.stage !== "accepted" || receipt.erasedAt || receipt.reconciliation)
       throw new RunnerChannelError("runner_request_mismatch", "Preparation requires this run's accepted cancellation receipt.");
     const target = receipt.payload.target as { runId: string; nativeTurnId: string };
-    const current = this.currentTurn(grant.nodeId);
+    const current = this.currentTurn(grant.nodeId, true);
     if (current?.runId !== target.runId || current.nativeTurnId !== target.nativeTurnId)
       return { receipt, withdrawal: { confirmed: false, pendingSubmissions: 0, notThisTurn: true } };
     if (receipt.withdrawal?.stage === "confirmed") return { receipt, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: receipt.withdrawal.withdrawn } };
@@ -168,11 +168,20 @@ export class RunnerChannel {
   }
 
   /** Current authenticated invocation evidence, never a claim that absence means idle. */
-  currentTurn(nodeId: string): { runId: string; nativeTurnId: string; acceptedTurnIds: string[] } | null {
+  currentTurn(nodeId: string, requireKnown = false): { runId: string; nativeTurnId: string; acceptedTurnIds: string[] } | null {
     const grant = this.grants.activeForNode(nodeId);
-    if (!grant?.runId || this.grants.standing(grant.grantId) !== "current"
-      || this.runnerMapLost(nodeId, grant.runId)
-      || this.outbox.runnerReceipts(nodeId, grant.runId).some(receipt => receipt.reconciliation)) return null;
+    if (!grant?.runId) return null;
+    const standing = this.standing(grant.grantId);
+    if (standing === "unverified" || standing === "pending") {
+      if (requireKnown) throw new RunnerChannelError(`runner_grant_${standing}`, `Runner grant is ${standing}.`);
+      return null;
+    }
+    if (standing !== "current") return null;
+    if (this.runnerMapLost(nodeId, grant.runId)
+      || this.outbox.runnerReceipts(nodeId, grant.runId).some(receipt => receipt.reconciliation)) {
+      if (requireKnown) throw new RunnerChannelError("runner_unavailable", "Native turn ownership is unknown; no cancellation outcome was inferred.");
+      return null;
+    }
     const row = this.outbox.db.prepare(`SELECT payload FROM events WHERE node_id=? AND type='agent.runner_turn'
       AND json_extract(payload,'$.runId')=? ORDER BY json_extract(payload,'$.sequence') DESC LIMIT 1`).get(nodeId, grant.runId) as { payload: string } | undefined;
     if (!row) return null;
